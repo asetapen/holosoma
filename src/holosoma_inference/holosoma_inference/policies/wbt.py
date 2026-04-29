@@ -34,6 +34,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # See ``holosoma_inference.policies.tracking_source`` for the contract.
         self._tracking_source: TrackingSource = tracking_source or NullTrackingSource()
 
+        # Lazy retargeter state. Populated on first non-None payload so that
+        # mink/mujoco are NOT imported at policy construction when no tracking
+        # source is in play — keeps NullTrackingSource byte-identical to the
+        # pre-change policy (no new dependency load path).
+        self._retargeter = None  # type: ignore[var-annotated]
+        self._retargeter_init_failed = False
+        self._retargeter_runtime_warned = False
+
         # initialize motion state
         self.motion_clip_progressing = False
         self.curr_motion_timestep = config.task.motion_start_timestep
@@ -267,19 +275,24 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Non-blocking poll of the external tracking source. On
         # NullTrackingSource (default) this returns None and the policy
         # falls through to the ONNX-clip motion_command_t path unchanged.
-        # On a concrete source, the payload is logged for now; translating
-        # SMPLH into motion_command_t (retargeting inside the service)
-        # is a follow-up. This split keeps the channel landable without
-        # blocking on retargeter design and gives external integrations a
-        # concrete round-trip to integration-test against.
+        # On a concrete source, translate the SMPLH payload into a
+        # ``(1, 58)`` motion_command_t via SMPLRetargeter and substitute
+        # it into ``self.motion_command_t`` BEFORE the ONNX policy runs,
+        # so the policy conditions on the teleop target instead of the
+        # clip. If retargeting fails (bad quats, IK divergence, missing
+        # URDF), we log once and fall through to the ONNX-clip path —
+        # the driver's sticky-fault contract expects the policy to keep
+        # producing commands under partial sensor failures.
         external = self._tracking_source.get_latest()
         if external is not None:
             logger.debug(
                 f"WBT tracking_source: received payload (device={external.device_type!r}, "
                 f"mode={external.mode}, body_joints={len(external.joint_names)}, "
-                f"hand_joints={len(external.hand_joint_names)}, quality={external.tracking_quality}) "
-                "— substitution into motion_command_t pending SMPLH retargeting bridge."
+                f"hand_joints={len(external.hand_joint_names)}, quality={external.tracking_quality})."
             )
+            retargeted = self._retarget_payload_to_motion_command(external)
+            if retargeted is not None:
+                self.motion_command_t = retargeted
 
         if not self.motion_clip_progressing:
             # Keep motion index pinned at the configured start while waiting to trigger the clip.
@@ -306,6 +319,90 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._set_motion_timestep()
 
         return self.scaled_policy_action
+
+    def _retarget_payload_to_motion_command(self, payload) -> np.ndarray | None:
+        """Translate a ``TrackingPayload`` into ``motion_command_t`` via SMPLRetargeter.
+
+        Returns a ``(1, 58)`` float32 array (29 DOF joint_pos followed by
+        29 DOF joint_vel) on success, or ``None`` when retargeting is not
+        usable — the caller falls through to the ONNX-clip path in that
+        case.
+
+        Failure modes handled here (all fall through, none raise):
+          * ``robot.urdf_path`` is unset → cannot construct the retargeter.
+          * SMPLRetargeter construction fails (missing deps, bad URDF).
+          * ``joint_transforms`` has the wrong size for (24, 7) reshape.
+          * ``retarget()`` raises (bad quaternions, IK divergence, etc).
+
+        The first retargeter construction is lazy — mink/mujoco are not
+        imported until a non-None payload arrives. This keeps
+        ``NullTrackingSource`` behavior byte-identical to today.
+        """
+        # Initial construction — tried at most once. If it fails, we stay
+        # in ONNX-clip mode for the remainder of this policy's lifetime.
+        if self._retargeter is None and not self._retargeter_init_failed:
+            urdf_path = getattr(self.config.robot, "urdf_path", None)
+            if not urdf_path:
+                self._retargeter_init_failed = True
+                logger.warning(
+                    "WBT tracking_source: received payload but robot.urdf_path is unset; "
+                    "cannot construct SMPLRetargeter — falling through to ONNX-clip motion_command."
+                )
+                return None
+            try:
+                from holosoma_retargeting.src.realtime_smpl_retargeter import SMPLRetargeter
+
+                dt = 1.0 / float(self.config.task.rl_rate)
+                self._retargeter = SMPLRetargeter(urdf_path=urdf_path, dt=dt)
+            except Exception as exc:  # noqa: BLE001
+                self._retargeter_init_failed = True
+                logger.warning(
+                    "WBT tracking_source: failed to construct SMPLRetargeter "
+                    f"(urdf_path={urdf_path!r}): {exc!r} — falling through to ONNX-clip motion_command."
+                )
+                return None
+
+        if self._retargeter is None:
+            return None
+
+        # Reshape flat transforms into (24, 7). TrackingPayload documents
+        # joint_transforms as a flattened (N, 7) array; we expect the SMPL
+        # 24-joint body ordering here.
+        try:
+            transforms = np.asarray(payload.joint_transforms, dtype=np.float32).reshape(24, 7)
+        except (ValueError, AttributeError) as exc:
+            if not self._retargeter_runtime_warned:
+                logger.warning(
+                    f"WBT tracking_source: joint_transforms reshape to (24, 7) failed ({exc!r}); "
+                    "falling through to ONNX-clip motion_command. Further failures suppressed."
+                )
+                self._retargeter_runtime_warned = True
+            return None
+
+        try:
+            q_joints, dq_joints, _root_orn_wxyz = self._retargeter.retarget(transforms)
+        except Exception as exc:  # noqa: BLE001
+            if not self._retargeter_runtime_warned:
+                logger.warning(
+                    f"WBT tracking_source: SMPLRetargeter.retarget raised {exc!r}; "
+                    "falling through to ONNX-clip motion_command. Further failures suppressed."
+                )
+                self._retargeter_runtime_warned = True
+            return None
+
+        q_joints = np.asarray(q_joints, dtype=np.float32).reshape(-1)
+        dq_joints = np.asarray(dq_joints, dtype=np.float32).reshape(-1)
+        if q_joints.size != self.num_dofs or dq_joints.size != self.num_dofs:
+            if not self._retargeter_runtime_warned:
+                logger.warning(
+                    f"WBT tracking_source: retargeter returned unexpected dim "
+                    f"(q={q_joints.size}, dq={dq_joints.size}, expected={self.num_dofs}); "
+                    "falling through to ONNX-clip motion_command."
+                )
+                self._retargeter_runtime_warned = True
+            return None
+
+        return np.concatenate([q_joints, dq_joints]).reshape(1, -1)
 
     def _configure_action_scales(self) -> None:
         """Configure action scales, prioritising ONNX metadata over config fallbacks.
