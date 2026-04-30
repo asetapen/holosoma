@@ -132,6 +132,31 @@ class UnitreeInterface(BaseInterface):
         cmd.kp = list(motor_kp * self._kp_level)
         cmd.kd = list(motor_kd * self._kd_level)
 
+        # Heartbeat — append to /tmp/blah.txt every 100 frames so we can
+        # confirm this code path is actually being reached on the real
+        # robot (and, if write_low_command ends up hanging, the file will
+        # show the LAST frame we made it past). Writes happen BEFORE the
+        # C++ binding call so "did we reach this line" is unambiguous.
+        if not hasattr(self, "_wlc_counter"):
+            self._wlc_counter = 0
+        self._wlc_counter += 1
+        if self._wlc_counter % 100 == 0:
+            try:
+                import os
+                import time
+
+                with open("/tmp/blah.txt", "a") as _f:
+                    _f.write(
+                        f"[{time.time():.3f}] pid={os.getpid()} wlc_count={self._wlc_counter} "
+                        f"q_target[:4]={list(cmd_q_target[:4])} "
+                        f"kp_level={self._kp_level:.3f} kd_level={self._kd_level:.3f} "
+                        f"motor_kp_mean={float(motor_kp.mean()):.3f} "
+                        f"motor_kd_mean={float(motor_kd.mean()):.3f}\n"
+                    )
+            except Exception:  # noqa: BLE001
+                # File I/O must never crash the control loop.
+                pass
+
         self.unitree_interface.write_low_command(cmd)
 
     def get_joystick_msg(self):
