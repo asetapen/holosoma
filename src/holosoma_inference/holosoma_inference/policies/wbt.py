@@ -17,6 +17,7 @@ from holosoma_inference.utils.clock import ClockSub
 from holosoma_inference.utils.math.quat import (
     matrix_from_quat,
     quat_mul,
+    quat_rotate_inverse,
     quat_to_rpy,
     rpy_to_quat,
     subtract_frame_transforms,
@@ -239,6 +240,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
     def get_current_obs_buffer_dict(self, robot_state_data):
         current_obs_buffer_dict = {}
 
+        # base_quat (used below for projected_gravity; not included in the
+        # ONNX obs itself for WBT).
+        current_obs_buffer_dict["base_quat"] = robot_state_data[:, 3:7]
+
         # motion_command
         current_obs_buffer_dict["motion_command"] = self.motion_command_t
 
@@ -266,6 +271,22 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         # actions
         current_obs_buffer_dict["actions"] = self.last_policy_action
+
+        # projected_gravity — mirrors BasePolicy.get_current_obs_buffer_dict's
+        # three-way selection (force-upright debug > interface-provided >
+        # compute from quat). Only consumed by dense-tracker observation
+        # presets (e.g. wbt-dense); the stock wbt preset's obs_dict doesn't
+        # reference it, so the extra entry is harmless.
+        expected_len = 7 + self.num_dofs + 6 + self.num_dofs
+        if self.config.task.debug.force_upright_imu:
+            current_obs_buffer_dict["projected_gravity"] = np.array([[0.0, 0.0, -1.0]])
+        elif robot_state_data.shape[1] == expected_len + 3:
+            current_obs_buffer_dict["projected_gravity"] = robot_state_data[:, expected_len : expected_len + 3]
+        else:
+            v = np.array([[0, 0, -1]])
+            current_obs_buffer_dict["projected_gravity"] = quat_rotate_inverse(
+                current_obs_buffer_dict["base_quat"], v
+            )
 
         return current_obs_buffer_dict
 
