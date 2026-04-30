@@ -31,12 +31,44 @@ class UnitreeInterface(BaseInterface):
         }
         message_type_map = {"HG": unitree_interface.MessageType.HG, "GO2": unitree_interface.MessageType.GO2}
 
+        # Participant diagnostics: confirm which processes end up on the same
+        # DDS domain / interface. Two unitree_interface participants on the
+        # same domain on the same NIC will create competing LowCommandWriter
+        # endpoints, and the robot firmware latches onto one — the other's
+        # write_low_command calls fall on the floor with no visible error.
+        import os as _os
+        import sys as _sys
+
+        cyclonedds_uri = _os.environ.get("CYCLONEDDS_URI", "<unset>")
+        cyclonedds_domain = _os.environ.get("CYCLONEDDS_DOMAIN", "<unset>")
+        ros_domain_id = _os.environ.get("ROS_DOMAIN_ID", "<unset>")
+        # The Python binding's create_robot() does NOT accept a domain_id;
+        # the C++ side hardcodes 0. Log the Python-side arg so callers can
+        # see the divergence.
+        print(
+            f"[unitree_interface] pid={_os.getpid()} ppid={_os.getppid()} "
+            f"iface={self.interface_str} "
+            f"python_domain_id_arg={self.domain_id} "
+            f"C++_domain_id=0 (hardcoded) "
+            f"ROS_DOMAIN_ID={ros_domain_id} "
+            f"CYCLONEDDS_DOMAIN={cyclonedds_domain} "
+            f"CYCLONEDDS_URI_set={cyclonedds_uri != '<unset>'}",
+            file=_sys.stderr,
+            flush=True,
+        )
+
         self.unitree_interface = unitree_interface.create_robot(
             self.interface_str,
             robot_type_map[self.robot_config.robot.upper()],
             message_type_map[self.robot_config.message_type.upper()],
         )
         self.unitree_interface.set_control_mode(unitree_interface.ControlMode.PR)
+
+        print(
+            f"[unitree_interface] pid={_os.getpid()} create_robot + set_control_mode(PR) complete",
+            file=_sys.stderr,
+            flush=True,
+        )
 
         # GO2 SDK motor order differs from joint order
         if self.robot_config.robot.lower() == "go2":
