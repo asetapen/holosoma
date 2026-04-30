@@ -208,13 +208,18 @@ class SMPLRetargeter:
         self._height_ratio: float | None = None
 
         # -- State for velocity computation and warm-starting --
-        self._prev_q_joints = np.zeros(self._mj_model.nq)
+        # Articulated joints only: the freejoint's 7 qpos entries are
+        # stripped in retarget() before we store joint state, so prev
+        # must match that shape (nq - 7 for freejoint-rooted models,
+        # nq otherwise).
+        self._num_joints = self._mj_model.nq - 7 if self._mj_model.nq > 7 else self._mj_model.nq
+        self._prev_q_joints = np.zeros(self._num_joints)
         self._prev_root_pos = np.zeros(3)
         self._prev_root_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0])
         self._initialized = False
 
-        # Pinocchio-compatible state for visualizer: [pos(3), quat_xyzw(4), joints(29)]
-        self._prev_q = np.zeros(3 + 4 + self._mj_model.nq)
+        # Pinocchio-compatible state for visualizer: [pos(3), quat_xyzw(4), joints(N)]
+        self._prev_q = np.zeros(3 + 4 + self._num_joints)
         self._prev_q[6] = 1.0  # identity quaternion w component at index 6 (xyzw)
 
     # ------------------------------------------------------------------
@@ -348,8 +353,13 @@ class SMPLRetargeter:
         # 5. Ground anchoring
         positions = self._anchor_to_ground(positions)
 
-        # 6. Solve IK via mink
-        q_joints = self._solve_ik_mink(positions, rotations)
+        # 6. Solve IK via mink. ``_solve_ik_mink`` returns the full qpos
+        # vector, which for a freejoint-rooted MuJoCo model is
+        # ``[x, y, z, qw, qx, qy, qz, *joint_angles]`` — the first 7 entries
+        # are the free base. The policy + robot SDK both expect only the
+        # 29 articulated joints, so slice them off here.
+        q_full = self._solve_ik_mink(positions, rotations)
+        q_joints = q_full[7:]  # drop freejoint qpos (xyz + wxyz)
 
         # 7. Finite-difference velocity
         if self._initialized:
@@ -376,10 +386,10 @@ class SMPLRetargeter:
     def reset(self):
         """Reset IK state."""
         self._config.update(np.zeros(self._mj_model.nq))
-        self._prev_q_joints = np.zeros(self._mj_model.nq)
+        self._prev_q_joints = np.zeros(self._num_joints)
         self._prev_root_pos = np.zeros(3)
         self._prev_root_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0])
-        self._prev_q = np.zeros(3 + 4 + self._mj_model.nq)
+        self._prev_q = np.zeros(3 + 4 + self._num_joints)
         self._prev_q[6] = 1.0  # identity quaternion w
         self._initialized = False
         self._height_ratio = None
