@@ -4,6 +4,8 @@ import numpy as np
 
 from holosoma_inference.config.config_types import RobotConfig
 from holosoma_inference.sdk.base.base_interface import BaseInterface
+from holosoma_inference.sdk.dampening import Dampener
+from holosoma_inference.sdk.send_log import SendLogger
 
 
 class UnitreeInterface(BaseInterface):
@@ -14,6 +16,8 @@ class UnitreeInterface(BaseInterface):
         self._unitree_motor_order = None
         self._kp_level = 1.0
         self._kd_level = 1.0
+        self._dampener = Dampener()
+        self._send_logger = SendLogger()
         self._init_binding()
 
     def _init_binding(self):
@@ -105,57 +109,54 @@ class UnitreeInterface(BaseInterface):
         kd_override: np.ndarray = None,
     ):
         """Send low-level command to robot."""
+        # Apply the dampening shim FIRST — in joint-space — before remapping
+        # to motor order. Keeps q_slew/q_limit/blend_alpha operating on the
+        # same axes as the robot_config joint limits.
+        motor_kp_cfg = np.asarray(
+            kp_override if kp_override is not None else self.robot_config.motor_kp,
+            dtype=np.float64,
+        )
+        motor_kd_cfg = np.asarray(
+            kd_override if kd_override is not None else self.robot_config.motor_kd,
+            dtype=np.float64,
+        )
+        q_d, dq_d, tau_d, kp_d, kd_d = self._dampener.apply(
+            cmd_q=np.asarray(cmd_q, dtype=np.float64),
+            cmd_dq=np.asarray(cmd_dq, dtype=np.float64),
+            cmd_tau=np.asarray(cmd_tau, dtype=np.float64),
+            kp=motor_kp_cfg,
+            kd=motor_kd_cfg,
+            dof_pos_latest=dof_pos_latest,
+        )
+
         cmd_q_target = np.zeros(self.robot_config.num_motors)
         cmd_dq_target = np.zeros(self.robot_config.num_motors)
         cmd_tau_target = np.zeros(self.robot_config.num_motors)
-        cmd_kp = np.zeros(self.robot_config.num_motors) if kp_override is not None else None
-        cmd_kd = np.zeros(self.robot_config.num_motors) if kd_override is not None else None
+        cmd_kp = np.zeros(self.robot_config.num_motors)
+        cmd_kd = np.zeros(self.robot_config.num_motors)
 
         motor_order = self._unitree_motor_order or self.robot_config.joint2motor
         for j_id in range(self.robot_config.num_joints):
             m_id = motor_order[j_id]
-            cmd_q_target[m_id] = float(cmd_q[j_id])
-            cmd_dq_target[m_id] = float(cmd_dq[j_id])
-            cmd_tau_target[m_id] = float(cmd_tau[j_id])
-            if cmd_kp is not None:
-                cmd_kp[m_id] = float(kp_override[j_id])
-            if cmd_kd is not None:
-                cmd_kd[m_id] = float(kd_override[j_id])
+            cmd_q_target[m_id] = float(q_d[j_id])
+            cmd_dq_target[m_id] = float(dq_d[j_id])
+            cmd_tau_target[m_id] = float(tau_d[j_id])
+            cmd_kp[m_id] = float(kp_d[j_id])
+            cmd_kd[m_id] = float(kd_d[j_id])
 
         cmd = self.unitree_interface.create_zero_command()
         cmd.q_target = list(cmd_q_target)
         cmd.dq_target = list(cmd_dq_target)
         cmd.tau_ff = list(cmd_tau_target)
+        cmd.kp = list(cmd_kp * self._kp_level)
+        cmd.kd = list(cmd_kd * self._kd_level)
 
-        motor_kp = np.array(cmd_kp if cmd_kp is not None else self.robot_config.motor_kp)
-        motor_kd = np.array(cmd_kd if cmd_kd is not None else self.robot_config.motor_kd)
-        cmd.kp = list(motor_kp * self._kp_level)
-        cmd.kd = list(motor_kd * self._kd_level)
-
-        # Heartbeat — append to /tmp/blah.txt every 100 frames so we can
-        # confirm this code path is actually being reached on the real
-        # robot (and, if write_low_command ends up hanging, the file will
-        # show the LAST frame we made it past). Writes happen BEFORE the
-        # C++ binding call so "did we reach this line" is unambiguous.
-        if not hasattr(self, "_wlc_counter"):
-            self._wlc_counter = 0
-        self._wlc_counter += 1
-        if self._wlc_counter % 100 == 0:
-            try:
-                import os
-                import time
-
-                with open("/tmp/blah.txt", "a") as _f:
-                    _f.write(
-                        f"[{time.time():.3f}] pid={os.getpid()} wlc_count={self._wlc_counter} "
-                        f"q_target[:4]={list(cmd_q_target[:4])} "
-                        f"kp_level={self._kp_level:.3f} kd_level={self._kd_level:.3f} "
-                        f"motor_kp_mean={float(motor_kp.mean()):.3f} "
-                        f"motor_kd_mean={float(motor_kd.mean()):.3f}\n"
-                    )
-            except Exception:  # noqa: BLE001
-                # File I/O must never crash the control loop.
-                pass
+        self._send_logger.maybe_log(
+            q_target=cmd_q_target,
+            kp=cmd_kp * self._kp_level,
+            kd=cmd_kd * self._kd_level,
+            unitree=self.unitree_interface,
+        )
 
         self.unitree_interface.write_low_command(cmd)
 

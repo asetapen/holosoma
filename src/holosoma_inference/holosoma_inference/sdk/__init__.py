@@ -23,6 +23,10 @@ def _load_builtin(sdk_type: str):
         from holosoma_inference.sdk.booster.booster_interface import BoosterInterface
 
         return BoosterInterface
+    if sdk_type == "mujoco":
+        from holosoma_inference.sdk.mujoco.mujoco_interface import MujocoInterface
+
+        return MujocoInterface
     return None
 
 
@@ -31,6 +35,11 @@ def create_interface(robot_config, domain_id=0, interface_str=None, use_joystick
 
     If *interface_str* is ``"auto"``, the network interface is resolved
     automatically via :func:`holosoma_inference.utils.network.detect_robot_interface`.
+
+    The env var ``HOLOSOMA_ROBOT_BACKEND`` overrides ``robot_config.sdk_type``
+    without requiring callers to rebuild the RobotConfig. Example:
+    ``HOLOSOMA_ROBOT_BACKEND=mujoco`` forces the MuJoCo virtual driver, even
+    when the shipped config says ``sdk_type='unitree'``.
     """
     # Resolve "auto" interface before passing to the SDK backend
     if interface_str == "auto":
@@ -38,7 +47,10 @@ def create_interface(robot_config, domain_id=0, interface_str=None, use_joystick
 
         interface_str = detect_robot_interface()
 
-    sdk_type = robot_config.sdk_type
+    import os as _os
+
+    backend_override = _os.environ.get("HOLOSOMA_ROBOT_BACKEND")
+    sdk_type = backend_override if backend_override else robot_config.sdk_type
     if sdk_type not in _entry_points and sdk_type not in _registry:
         # Fallback for environments where entry-point discovery via
         # importlib.metadata returns empty (e.g. bazel runfiles that
