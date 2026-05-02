@@ -25,6 +25,7 @@ import numpy as np
 from holosoma_inference.config.config_types import RobotConfig
 from holosoma_inference.sdk.base.base_interface import BaseInterface
 from holosoma_inference.sdk.dampening import Dampener
+from holosoma_inference.sdk.send_log import SendLogger
 
 
 def _resolve_mjcf_path(robot_config: RobotConfig) -> Path:
@@ -149,6 +150,7 @@ class MujocoInterface(BaseInterface):
         mujoco.mj_forward(self.model, self.data)
 
         self._dampener = Dampener(joint_limits_lo=lo, joint_limits_hi=hi)
+        self._send_logger = SendLogger()
         self._last_cmd_time = time.monotonic()
         self._lock = threading.Lock()
 
@@ -216,6 +218,12 @@ class MujocoInterface(BaseInterface):
             "kp": kp_d * self._kp_level,
             "kd": kd_d * self._kd_level,
         }
+
+        self._send_logger.maybe_log(
+            q_target=q_d,
+            kp=kp_d * self._kp_level,
+            kd=kd_d * self._kd_level,
+        )
 
         if self._real_time:
             now = time.monotonic()
