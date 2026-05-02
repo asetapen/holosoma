@@ -48,3 +48,25 @@ def test_create_interface_env_override(monkeypatch):
     # sdk_type in config says "unitree" but env forces "mujoco".
     iface = create_interface(cfg, interface_str="lo", use_joystick=False)
     assert iface.__class__.__name__ == "MujocoInterface"
+
+
+def test_unitree_interface_loads_mjcf_joint_limits():
+    """The UnitreeInterface Dampener should auto-pick up MJCF joint limits
+    so HOLOSOMA_Q_LIMIT_SCALE is not a silent no-op on hardware. We can't
+    instantiate the full UnitreeInterface without the C++ binding, so
+    exercise the helper directly."""
+    pytest.importorskip("mujoco")
+    pytest.importorskip("holosoma_retargeting")
+    from holosoma_inference.config.config_values.robot import g1_29dof
+    from holosoma_inference.sdk.unitree.unitree_interface import _load_joint_limits_from_mjcf
+
+    limits = _load_joint_limits_from_mjcf(g1_29dof)
+    assert limits is not None
+    lo, hi = limits
+    assert lo.shape == (29,)
+    assert hi.shape == (29,)
+    # left_knee_joint should be the canonical [-0.087, 2.88] we've been
+    # using as the hardware-debugging anchor.
+    knee_idx = g1_29dof.dof_names.index("left_knee_joint")
+    assert abs(lo[knee_idx] - (-0.087267)) < 1e-3
+    assert abs(hi[knee_idx] - 2.8798) < 1e-3

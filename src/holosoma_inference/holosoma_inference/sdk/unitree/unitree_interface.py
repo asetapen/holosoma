@@ -1,11 +1,72 @@
 """Unitree robot interface using C++/pybind11 binding."""
 
+import os
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 
 from holosoma_inference.config.config_types import RobotConfig
 from holosoma_inference.sdk.base.base_interface import BaseInterface
 from holosoma_inference.sdk.dampening import Dampener
 from holosoma_inference.sdk.send_log import SendLogger
+
+
+def _load_joint_limits_from_mjcf(robot_config: RobotConfig) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Best-effort MJCF joint-limit lookup for the dampening clip knob.
+
+    The Unitree hardware path has no joint-range info in RobotConfig today,
+    so without this helper HOLOSOMA_Q_LIMIT_SCALE is a no-op on real
+    robots. Resolve the same 29dof MJCF the retargeter uses and pull the
+    limits in dof_names order. Returns (lo, hi) arrays or None if the MJCF
+    isn't reachable (host without holosoma_retargeting installed, etc.).
+    """
+    try:
+        import mujoco
+    except ImportError:
+        return None
+    # Look first at HOLOSOMA_MUJOCO_MJCF (same override the sim backend
+    # uses), then at robot_config.urdf_path if it's a .xml, then the
+    # shipped MJCF via holosoma_retargeting.
+    override = os.environ.get("HOLOSOMA_MUJOCO_MJCF")
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override))
+    urdf = getattr(robot_config, "urdf_path", None)
+    if urdf and urdf.endswith(".xml"):
+        candidates.append(Path(urdf))
+    try:
+        import holosoma_retargeting  # type: ignore
+
+        candidates.append(
+            Path(holosoma_retargeting.__file__).parent
+            / "models"
+            / robot_config.robot
+            / f"{robot_config.robot_type}.xml"
+        )
+    except Exception:
+        pass
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            model = mujoco.MjModel.from_xml_path(str(path))
+        except Exception:
+            continue
+        lo = np.full(robot_config.num_joints, -np.inf)
+        hi = np.full(robot_config.num_joints, np.inf)
+        any_named = False
+        for j_id, name in enumerate(robot_config.dof_names):
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            if jid < 0:
+                continue
+            any_named = True
+            if bool(model.jnt_limited[jid]):
+                lo[j_id] = float(model.jnt_range[jid][0])
+                hi[j_id] = float(model.jnt_range[jid][1])
+        if any_named:
+            return lo, hi
+    return None
 
 
 class UnitreeInterface(BaseInterface):
@@ -16,7 +77,11 @@ class UnitreeInterface(BaseInterface):
         self._unitree_motor_order = None
         self._kp_level = 1.0
         self._kd_level = 1.0
-        self._dampener = Dampener()
+        limits = _load_joint_limits_from_mjcf(robot_config)
+        if limits is not None:
+            self._dampener = Dampener(joint_limits_lo=limits[0], joint_limits_hi=limits[1])
+        else:
+            self._dampener = Dampener()
         self._send_logger = SendLogger()
         self._init_binding()
 
