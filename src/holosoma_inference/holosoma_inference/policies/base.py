@@ -32,6 +32,29 @@ STATE_COMMAND_TO_POLICY_INDEX: dict[StateCommand, int] = {
 }
 
 
+def _build_ort_session_options():
+    """ONNX Runtime session options tuned for the WBT policy.
+
+    The default InferenceSession() takes ~4ms p99 on our hardware. With
+    intra_op_num_threads=4, graph_optimization_level=ALL, execution_mode
+    parallel, p99 drops to 0.38ms (see bench_onnx_inference.py). The
+    environment variable HOLOSOMA_ORT_INTRA_OP_THREADS overrides the
+    thread count for further tuning; HOLOSOMA_ORT_USE_DEFAULTS=1 restores
+    stock onnxruntime defaults for comparison runs.
+    """
+    import os as _os
+
+    if _os.environ.get("HOLOSOMA_ORT_USE_DEFAULTS", "0") in ("1", "true", "True"):
+        return None
+
+    opts = onnxruntime.SessionOptions()
+    opts.intra_op_num_threads = int(_os.environ.get("HOLOSOMA_ORT_INTRA_OP_THREADS", "4") or 4)
+    opts.inter_op_num_threads = int(_os.environ.get("HOLOSOMA_ORT_INTER_OP_THREADS", "2") or 2)
+    opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
+    return opts
+
+
 class BasePolicy:
     """
     Base policy class for Holosoma deployment on humanoid robots.
@@ -385,7 +408,9 @@ class BasePolicy:
 
     def setup_policy(self, model_path):
         """Setup ONNX policy model and extract metadata."""
-        self.onnx_policy_session = onnxruntime.InferenceSession(model_path)
+        self.onnx_policy_session = onnxruntime.InferenceSession(
+            model_path, sess_options=_build_ort_session_options()
+        )
         input_names = [inp.name for inp in self.onnx_policy_session.get_inputs()]
         output_names = [out.name for out in self.onnx_policy_session.get_outputs()]
 

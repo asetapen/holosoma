@@ -139,7 +139,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
         return xyzw_to_wxyz(ref_ori_xyzw)
 
     def setup_policy(self, model_path):
-        self.onnx_policy_session = onnxruntime.InferenceSession(model_path)
+        from holosoma_inference.policies.base import _build_ort_session_options
+
+        self.onnx_policy_session = onnxruntime.InferenceSession(
+            model_path, sess_options=_build_ort_session_options()
+        )
         self.onnx_input_names = [inp.name for inp in self.onnx_policy_session.get_inputs()]
         self.onnx_output_names = [out.name for out in self.onnx_policy_session.get_outputs()]
 
@@ -292,6 +296,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def rl_inference(self, robot_state_data):
         # prepare obs, run policy inference
+        import os as _os
+        import time as _time
+
+        _dbg = _os.environ.get("HOLOSOMA_INFERENCE_TIMING", "0") in ("1", "true", "True")
+        _ts: list[tuple[str, float]] = []
+        if _dbg:
+            _ts.append(("start", _time.perf_counter()))
 
         # Non-blocking poll of the external tracking source. On
         # NullTrackingSource (default) this returns None and the policy
@@ -305,6 +316,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # the driver's sticky-fault contract expects the policy to keep
         # producing commands under partial sensor failures.
         external = self._tracking_source.get_latest()
+        if _dbg:
+            _ts.append(("tracking_poll", _time.perf_counter()))
         if external is not None:
             logger.debug(
                 f"WBT tracking_source: received payload (device={external.device_type!r}, "
@@ -314,6 +327,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
             retargeted = self._retarget_payload_to_motion_command(external)
             if retargeted is not None:
                 self.motion_command_t = retargeted
+        if _dbg:
+            _ts.append(("retarget", _time.perf_counter()))
 
         if not self.motion_clip_progressing:
             # Keep motion index pinned at the configured start while waiting to trigger the clip.
@@ -321,11 +336,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.curr_motion_timestep = self.timestep_util.timestep
 
         obs = self.prepare_obs_for_rl(robot_state_data)
+        if _dbg:
+            _ts.append(("prepare_obs", _time.perf_counter()))
         if self.config.task.print_observations:
             self._print_observations(obs)
 
         input_feed = {"time_step": np.array([[self.curr_motion_timestep]], dtype=np.float32), "obs": obs["actor_obs"]}
         policy_action, self.motion_command_t, self.ref_quat_xyzw_t = self.policy(input_feed)
+        if _dbg:
+            _ts.append(("policy", _time.perf_counter()))
 
         # clip policy action
         policy_action = np.clip(policy_action, -100, 100)
@@ -338,6 +357,12 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.scaled_policy_action = policy_action * self.per_joint_policy_action_scale
         # update motion timestep
         self._set_motion_timestep()
+        if _dbg and len(_ts) > 1:
+            parts = []
+            for i in range(1, len(_ts)):
+                dt_ms = (_ts[i][1] - _ts[i - 1][1]) * 1000.0
+                parts.append(f"{_ts[i][0]}={dt_ms:.2f}ms")
+            logger.info(f"[inference_timing] " + " ".join(parts))
 
         return self.scaled_policy_action
 
