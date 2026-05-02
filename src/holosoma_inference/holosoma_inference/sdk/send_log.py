@@ -19,6 +19,10 @@ HOLOSOMA_SEND_LOG_EVERY   int, default 100. Log every Nth frame.
 HOLOSOMA_SEND_LOG_DIR     dir for jsonl files; default /tmp.
 HOLOSOMA_SEND_LOG_INCLUDE_STATE  "1" to call read_low_state each log frame
                                  (slower; only useful on hardware).
+HOLOSOMA_SEND_LOG_FULL           "1" to log all 29 joint values instead of
+                                 just the first 6 (default off; files grow
+                                 ~4.8× when enabled). Enable when the
+                                 analyzer needs upper-body coverage.
 """
 
 from __future__ import annotations
@@ -77,11 +81,12 @@ class SendLogger:
         every = _env_int("HOLOSOMA_SEND_LOG_EVERY", 100)
         if every <= 0 or self._counter % every != 0:
             return
+        q_slice = list(q_target) if _env_bool("HOLOSOMA_SEND_LOG_FULL", False) else list(q_target[:6])
         record: dict[str, Any] = {
             "ts": time.time(),
             "pid": os.getpid(),
             "frame": self._counter,
-            "q_target": [float(v) for v in list(q_target[:6])],  # first few to keep line short
+            "q_target": [float(v) for v in q_slice],
             "kp_mean": float(sum(kp) / max(1, len(kp))),
             "kd_mean": float(sum(kd) / max(1, len(kd))),
         }

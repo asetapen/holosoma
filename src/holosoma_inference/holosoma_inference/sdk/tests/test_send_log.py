@@ -49,3 +49,24 @@ def test_skips_state_when_unitree_none(tmp_log_dir, monkeypatch):
     files = list(tmp_log_dir.glob("*.jsonl"))
     rec = json.loads(files[0].read_text().splitlines()[0])
     assert "state" not in rec
+
+
+def test_truncates_q_target_by_default(tmp_log_dir, monkeypatch):
+    monkeypatch.setenv("HOLOSOMA_SEND_LOG", "1")
+    monkeypatch.setenv("HOLOSOMA_SEND_LOG_EVERY", "1")
+    monkeypatch.delenv("HOLOSOMA_SEND_LOG_FULL", raising=False)
+    log = SendLogger()
+    log.maybe_log(q_target=list(range(29)), kp=[100.0] * 29, kd=[5.0] * 29)
+    rec = json.loads(list(tmp_log_dir.glob("*.jsonl"))[0].read_text().splitlines()[0])
+    assert len(rec["q_target"]) == 6
+
+
+def test_logs_full_q_target_when_requested(tmp_log_dir, monkeypatch):
+    monkeypatch.setenv("HOLOSOMA_SEND_LOG", "1")
+    monkeypatch.setenv("HOLOSOMA_SEND_LOG_EVERY", "1")
+    monkeypatch.setenv("HOLOSOMA_SEND_LOG_FULL", "1")
+    log = SendLogger()
+    log.maybe_log(q_target=list(range(29)), kp=[100.0] * 29, kd=[5.0] * 29)
+    rec = json.loads(list(tmp_log_dir.glob("*.jsonl"))[0].read_text().splitlines()[0])
+    assert len(rec["q_target"]) == 29
+    assert rec["q_target"][-1] == 28.0
