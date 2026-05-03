@@ -319,11 +319,21 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if _dbg:
             _ts.append(("tracking_poll", _time.perf_counter()))
         if external is not None:
-            logger.debug(
-                f"WBT tracking_source: received payload (device={external.device_type!r}, "
-                f"mode={external.mode}, body_joints={len(external.joint_names)}, "
-                f"hand_joints={len(external.hand_joint_names)}, quality={external.tracking_quality})."
-            )
+            # Payload log was firing on every inference tick (50-100 Hz),
+            # drowning legitimate WARN/ERROR in DEBUG mode. Throttle to
+            # one line per 200 payloads so a pathological source (quality
+            # flipping, device swap) still shows up without the volume.
+            if not hasattr(self, "_external_log_counter"):
+                self._external_log_counter = 0
+            self._external_log_counter += 1
+            if self._external_log_counter % 200 == 1:
+                logger.debug(
+                    f"WBT tracking_source: payload #{self._external_log_counter} "
+                    f"device={external.device_type!r} mode={external.mode} "
+                    f"body_joints={len(external.joint_names)} "
+                    f"hand_joints={len(external.hand_joint_names)} "
+                    f"quality={external.tracking_quality}"
+                )
             retargeted = self._retarget_payload_to_motion_command(external)
             if retargeted is not None:
                 self.motion_command_t = retargeted
