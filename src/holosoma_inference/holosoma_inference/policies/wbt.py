@@ -409,7 +409,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 from holosoma_retargeting.src.realtime_smpl_retargeter import SMPLRetargeter
 
                 dt = 1.0 / float(self.config.task.rl_rate)
-                self._retargeter = SMPLRetargeter(urdf_path=urdf_path, dt=dt)
+                import os as _os
+
+                ik_iters = int(_os.environ.get("HOLOSOMA_RETARGETER_IK_ITERS", "4") or 4)
+                self._retargeter = SMPLRetargeter(urdf_path=urdf_path, dt=dt, max_ik_iters=ik_iters)
             except Exception as exc:  # noqa: BLE001
                 self._retargeter_init_failed = True
                 logger.warning(

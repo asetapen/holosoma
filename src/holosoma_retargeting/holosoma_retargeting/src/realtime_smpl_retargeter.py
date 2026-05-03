@@ -315,6 +315,11 @@ class SMPLRetargeter:
             dq_joints: (29,) joint velocities via finite difference.
             root_orn_wxyz: (4,) root orientation quaternion (wxyz).
         """
+        import os as _os
+        import time as _time
+
+        _dbg = _os.environ.get("HOLOSOMA_RETARGET_STAGE_TIMING", "0") in ("1", "true", "True")
+        _t0 = _time.perf_counter() if _dbg else 0.0
         joint_poses = np.asarray(joint_poses, dtype=np.float64).reshape(NUM_JOINTS, 7)
 
         positions = joint_poses[:, :3].copy()
@@ -353,6 +358,8 @@ class SMPLRetargeter:
         # 5. Ground anchoring
         positions = self._anchor_to_ground(positions)
 
+        if _dbg:
+            _t_pre_ik = _time.perf_counter()
         # 6. Solve IK via mink. ``_solve_ik_mink`` returns the full qpos
         # vector, which for a freejoint-rooted MuJoCo model is
         # ``[x, y, z, qw, qx, qy, qz, *joint_angles]`` — the first 7 entries
@@ -360,6 +367,8 @@ class SMPLRetargeter:
         # 29 articulated joints, so slice them off here.
         q_full = self._solve_ik_mink(positions, rotations)
         q_joints = q_full[7:]  # drop freejoint qpos (xyz + wxyz)
+        if _dbg:
+            _t_post_ik = _time.perf_counter()
 
         # 7. Finite-difference velocity
         if self._initialized:
@@ -375,6 +384,14 @@ class SMPLRetargeter:
 
         # Pinocchio-compatible _prev_q for visualizer (pos[3] + quat_xyzw[4] + joints[29])
         self._prev_q = np.concatenate([positions[0], root_body_quat_xyzw, q_joints])
+        if _dbg:
+            _t_end = _time.perf_counter()
+            logger.info(
+                f"[retarget_stage] pre_ik={((_t_pre_ik - _t0) * 1000):.2f}ms "
+                f"ik={((_t_post_ik - _t_pre_ik) * 1000):.2f}ms "
+                f"post_ik={((_t_end - _t_post_ik) * 1000):.2f}ms "
+                f"total={((_t_end - _t0) * 1000):.2f}ms"
+            )
 
         # 9. Root orientation as wxyz (pre-offset = actual body orientation)
         root_orn_wxyz = np.array(
