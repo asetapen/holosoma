@@ -331,7 +331,16 @@ class BasePolicy:
 
     def _init_rate_handler(self):
         """Initialize rate limiter and logger."""
+        import os as _os
+
+        env_rate = _os.environ.get("HOLOSOMA_RL_RATE_HZ")
         self.rl_rate = self.config.task.rl_rate
+        if env_rate:
+            try:
+                self.rl_rate = float(env_rate)
+                logger.info(f"rl_rate overridden by HOLOSOMA_RL_RATE_HZ={self.rl_rate}")
+            except ValueError:
+                pass
         self.logger = logger
         self.rate = RateLimiter(self.rl_rate)
 
