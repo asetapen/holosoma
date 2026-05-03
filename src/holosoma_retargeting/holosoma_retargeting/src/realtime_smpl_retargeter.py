@@ -392,6 +392,13 @@ class SMPLRetargeter:
 
         # Pinocchio-compatible _prev_q for visualizer (pos[3] + quat_xyzw[4] + joints[29])
         self._prev_q = np.concatenate([positions[0], root_body_quat_xyzw, q_joints])
+
+        # Public snapshot of the mink-solved root transform. Callers that
+        # need both root position and orientation (visualizers, FK over
+        # the freejoint-rooted MJCF) should read these rather than
+        # reaching into ``_config.q[:7]``.
+        self.last_root_pos = q_full[:3].copy()
+        self.last_root_quat_wxyz = q_full[3:7].copy()
         if _dbg:
             _t_end = _time.perf_counter()
             logger.info(

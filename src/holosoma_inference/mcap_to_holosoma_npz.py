@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Convert a /pico_body_state MCAP into a holosoma reference-motion NPZ.
 
-Produces the same schema ``wbt_wrappers_inference.run_policy
-inference:g1-29dof-holosoma-wbt --task.ref-motion-path ...`` expects:
-``joint_pos`` (T, 36 = root_pos 3 + root_quat_wxyz 4 + joints 29),
-``joint_vel`` (T, 35), ``body_pos_w`` (T, 32, 3), ``body_quat_w``
-(T, 32, 4), plus ``fps`` / ``joint_names`` / ``body_names`` tags.
+Produces the NPZ schema the policy's ``--task.ref-motion-path`` flag
+expects: ``joint_pos`` (T, 36 = root_pos 3 + root_quat_wxyz 4 +
+joints 29), ``joint_vel`` (T, 35), ``body_pos_w`` (T, B, 3),
+``body_quat_w`` (T, B, 4) where B = len(G1_BODY_NAMES), plus
+``fps`` / ``joint_names`` / ``body_names`` tags.
 
 Pipeline:
     1. Decode /pico_body_state → (T, 24, 7) SMPL body joints
@@ -29,14 +29,21 @@ import struct
 import sys
 from pathlib import Path
 
-os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else "egl")
+
+def _set_mujoco_gl_default() -> None:
+    """Default MUJOCO_GL to egl (linux) / glfw (darwin) for offscreen rendering.
+
+    Called from ``main()`` so importing this module as a library does not
+    mutate the caller's environment.
+    """
+    os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else "egl")
 
 
 # ---------------------------------------------------------------------------
 # G1 body name table (matches holosoma NPZ convention)
 # ---------------------------------------------------------------------------
 
-G1_BODY_NAMES_32 = [
+G1_BODY_NAMES = [
     "pelvis",
     "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link",
     "left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link",
@@ -49,8 +56,6 @@ G1_BODY_NAMES_32 = [
     "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link",
     "right_elbow_link", "right_wrist_roll_link", "right_wrist_pitch_link",
     "right_wrist_yaw_link",
-    "logo_link",  # aesthetic link on the G1 torso
-    "imu_in_pelvis",  # IMU frame
 ]
 
 
@@ -77,6 +82,19 @@ def _load_mcap(mcap_path: Path):
 
     if not poses:
         raise RuntimeError(f"no /pico_body_state frames in {mcap_path}")
+
+    # Sanity-check the first frame's pelvis quaternion. The decoder
+    # assumes body_joint_poses is the first field in the CDR payload;
+    # if the schema grows a preceding field we'd silently decode the
+    # wrong floats and blow through the retargeter on garbage.
+    pelvis_quat = poses[0][0, 3:7]
+    quat_norm = float(np.linalg.norm(pelvis_quat))
+    if not 0.9 < quat_norm < 1.1:
+        raise RuntimeError(
+            f"first-frame pelvis quaternion has norm {quat_norm:.3f}, expected ~1.0; "
+            "the /pico_body_state CDR layout may have changed — the decoder "
+            "assumes body_joint_poses is the first field."
+        )
     return np.stack(poses, axis=0), np.asarray(times, dtype=np.int64)
 
 
@@ -91,18 +109,26 @@ def _retarget_sequence(poses, mjcf_path: str):
     rp = np.zeros((T, 3), dtype=np.float64)
     rq = np.zeros((T, 4), dtype=np.float64)
 
+    # Target pelvis height for the first frame. Use the retargeter's
+    # neutral pelvis z (measured via FK at construction time against the
+    # MJCF's home qpos) rather than a hardcoded 0.793 so this stays
+    # consistent if the upstream MJCF is updated.
+    target_pelvis_z = float(rt._g1_leg)
+
     z_offset = None
     for i in range(T):
         q_joints, _, _ = rt.retarget(poses[i])
         q[i] = q_joints
-        cfg_q = rt._config.q
-        rp[i] = np.asarray(cfg_q[:3], dtype=np.float64)
-        rq[i] = np.asarray(cfg_q[3:7], dtype=np.float64)
+        rp[i] = rt.last_root_pos
+        rq[i] = rt.last_root_quat_wxyz
         if z_offset is None:
-            # Lift the pelvis so the first frame sits at G1's default pelvis
-            # height (0.793 m). Downstream FK and the policy both expect a
-            # standing motion that doesn't start underground.
-            z_offset = 0.793 - rp[i, 2]
+            # One-shot lift: shift every frame by the same constant so
+            # the first-frame pelvis sits at the neutral standing
+            # height. This preserves motion dynamics (squats, steps) but
+            # assumes the recording starts from a standing pose — if
+            # the operator started crouched the whole clip rides high
+            # until the next conversion pass.
+            z_offset = target_pelvis_z - rp[i, 2]
         rp[i, 2] += z_offset
         if (i + 1) % 200 == 0 or i == T - 1:
             print(f"  retargeted {i + 1}/{T}", flush=True)
@@ -112,6 +138,20 @@ def _retarget_sequence(poses, mjcf_path: str):
 def _interp_to_fps(rp, rq_wxyz, q, in_stamps_ns, out_fps):
     import numpy as np
     from scipy.spatial.transform import Rotation, Slerp
+
+    # np.interp + Slerp require strictly-increasing xp. MCAP readers
+    # iterate messages in chunk order, which is usually but not always
+    # time-sorted. Sort + drop duplicate-timestamp frames.
+    order = np.argsort(in_stamps_ns, kind="stable")
+    in_stamps_ns = in_stamps_ns[order]
+    rp = rp[order]
+    rq_wxyz = rq_wxyz[order]
+    q = q[order]
+    unique_mask = np.concatenate(([True], np.diff(in_stamps_ns) > 0))
+    in_stamps_ns = in_stamps_ns[unique_mask]
+    rp = rp[unique_mask]
+    rq_wxyz = rq_wxyz[unique_mask]
+    q = q[unique_mask]
 
     t_in = (in_stamps_ns - in_stamps_ns[0]) / 1e9
     duration = float(t_in[-1])
@@ -134,7 +174,8 @@ def _interp_to_fps(rp, rq_wxyz, q, in_stamps_ns, out_fps):
 
 
 def _fk_bodies(rp, rq_wxyz, q, mjcf_path: str):
-    """Run MuJoCo FK. Returns (body_pos_w (T,32,3), body_quat_w (T,32,4))."""
+    """Run MuJoCo FK. Returns ``(body_pos_w, body_quat_w)`` arrays shaped
+    ``(T, len(G1_BODY_NAMES), 3)`` and ``(T, len(G1_BODY_NAMES), 4)``."""
     import mujoco
     import numpy as np
 
@@ -144,18 +185,27 @@ def _fk_bodies(rp, rq_wxyz, q, mjcf_path: str):
 
     body_indices = []
     missing = []
-    for n in G1_BODY_NAMES_32:
+    for n in G1_BODY_NAMES:
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)
         if bid < 0:
             missing.append(n)
-            body_indices.append(0)  # fallback to world
         else:
             body_indices.append(bid)
     if missing:
-        print(f"  WARN: MJCF missing bodies: {missing}", file=sys.stderr)
+        # Silently falling back to body-id 0 (world) would emit
+        # zero-vector body_pos_w / identity body_quat_w for the
+        # missing links, which becomes garbage training data
+        # downstream. Fail loudly — the caller should update
+        # G1_BODY_NAMES or point at a matching MJCF.
+        raise RuntimeError(
+            f"MJCF at {mjcf_path} is missing required body links: {missing}. "
+            "Update G1_BODY_NAMES in this script or pass --mjcf pointing "
+            "at a MJCF that includes them."
+        )
 
-    bp = np.zeros((T, 32, 3))
-    bq = np.zeros((T, 32, 4))
+    n_bodies = len(G1_BODY_NAMES)
+    bp = np.zeros((T, n_bodies, 3))
+    bq = np.zeros((T, n_bodies, 4))
     for t in range(T):
         data.qpos[0:3] = rp[t]
         data.qpos[3:7] = rq_wxyz[t]  # wxyz
@@ -167,6 +217,8 @@ def _fk_bodies(rp, rq_wxyz, q, mjcf_path: str):
 
 
 def main() -> int:
+    _set_mujoco_gl_default()
+
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mcap", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
@@ -194,11 +246,14 @@ def main() -> int:
     T_out = rp_out.shape[0]
     print(f"  produced {T_out} frames at {args.fps} Hz", flush=True)
 
-    print("Running MuJoCo FK for 32 body poses ...", flush=True)
+    print(f"Running MuJoCo FK for {len(G1_BODY_NAMES)} body poses ...", flush=True)
     bp, bq_wxyz = _fk_bodies(rp_out, rq_out_wxyz, q_out, str(args.mjcf))
 
     # Finite-difference velocities.
-    dt = 1.0 / args.fps
+    # Compute dt from the actual interpolated time grid so clips whose
+    # duration isn't an integer number of frames at the requested fps
+    # don't silently produce ~0.1%-biased velocities.
+    dt = float(stamps[-1] - stamps[0]) / 1e9 / max(T_out - 1, 1) if T_out > 1 else 1.0 / args.fps
     bp_lin_vel = np.gradient(bp, dt, axis=0)
     bq_xyzw = bq_wxyz[:, :, [1, 2, 3, 0]]
     from scipy.spatial.transform import Rotation
@@ -243,7 +298,7 @@ def main() -> int:
         "body_lin_vel_w": bp_lin_vel.astype(np.float64),
         "body_ang_vel_w": ang_vel.astype(np.float64),
         "joint_names": np.array(G1_JOINT_NAMES_29),
-        "body_names": np.array(G1_BODY_NAMES_32),
+        "body_names": np.array(G1_BODY_NAMES),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(args.out, **out)

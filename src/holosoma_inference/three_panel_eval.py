@@ -39,7 +39,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else "egl")
+
+def _set_mujoco_gl_default() -> None:
+    """Default ``MUJOCO_GL`` to egl (linux) / glfw (darwin) for offscreen rendering.
+
+    Called from ``main()`` so importing this module as a library does
+    not mutate the caller's environment.
+    """
+    os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else "egl")
+
 
 # SMPL 24-joint parent indices (body-only; standard SMPL kinematic tree).
 # index = child, value = parent (-1 for root).
@@ -125,6 +133,20 @@ def _load_pico_frames(mcap_path: Path, max_frames: int | None):
 
     if not poses:
         return np.zeros((0, 24, 7)), np.zeros((0,), dtype=np.int64)
+
+    # Sanity-check the first frame: the pelvis quaternion (cols 3-7)
+    # must have unit norm. If the schema ever grows a field before
+    # body_joint_poses, the hardcoded CDR offset of 4 lands us at the
+    # wrong floats and this check catches it loudly before the policy
+    # sees garbage.
+    pelvis_quat = poses[0][0, 3:7]
+    quat_norm = float(np.linalg.norm(pelvis_quat))
+    if not 0.9 < quat_norm < 1.1:
+        raise RuntimeError(
+            f"first-frame pelvis quaternion has norm {quat_norm:.3f}, expected ~1.0; "
+            "the /pico_body_state CDR layout may have changed — decoder assumes "
+            "body_joint_poses is the first field."
+        )
     return np.stack(poses, axis=0), np.asarray(times_ns, dtype=np.int64)
 
 
@@ -144,9 +166,7 @@ def _cdr_align(buf: bytes, off: int, boundary: int) -> int:
 
 def _cdr_read_string(buf: bytes, off: int) -> tuple[str, int]:
     off = _cdr_align(buf, off, 4)
-    import struct as _s
-
-    (n,) = _s.unpack_from("<I", buf, off)
+    (n,) = struct.unpack_from("<I", buf, off)
     off += 4
     # n includes the trailing NUL
     s = buf[off : off + n - 1].decode("utf-8", errors="replace")
@@ -155,12 +175,12 @@ def _cdr_read_string(buf: bytes, off: int) -> tuple[str, int]:
 
 
 def _decode_joint_trajectory_cdr(cdr_buf: bytes):
-    """Decode a holosoma_msgs/JointTrajectory CDR payload.
+    """Decode a JointTrajectory CDR payload.
 
     Layout (post 4-byte encapsulation header):
         Header
-            uint32 sec            # CDR stores builtin_interfaces/Time
-            uint32 nanosec        # as two uint32s on ROS 2 Jazzy
+            int32  sec            # builtin_interfaces/Time stores sec
+            uint32 nanosec        # as (sec: int32, nanosec: uint32)
             string frame_id
         string[] joint_names
         float32[] positions
@@ -168,20 +188,21 @@ def _decode_joint_trajectory_cdr(cdr_buf: bytes):
         float32[] accelerations
     Returns (stamp_ns, joint_names, positions, velocities, accelerations).
     """
-    import struct as _s
-
     import numpy as np
 
     off = 4  # skip encapsulation header
     off = _cdr_align(cdr_buf, off, 4)
-    (sec,) = _s.unpack_from("<I", cdr_buf, off); off += 4
-    (nanosec,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    # sec is int32 (signed) per builtin_interfaces/Time; unpack accordingly
+    # so negative time stamps (rare, but possible on clock drift) don't
+    # become huge unsigned values.
+    (sec,) = struct.unpack_from("<i", cdr_buf, off); off += 4
+    (nanosec,) = struct.unpack_from("<I", cdr_buf, off); off += 4
     stamp_ns = int(sec) * 1_000_000_000 + int(nanosec)
     _frame_id, off = _cdr_read_string(cdr_buf, off)
 
     # string[] joint_names
     off = _cdr_align(cdr_buf, off, 4)
-    (n_names,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    (n_names,) = struct.unpack_from("<I", cdr_buf, off); off += 4
     names = []
     for _ in range(n_names):
         s, off = _cdr_read_string(cdr_buf, off)
@@ -189,21 +210,21 @@ def _decode_joint_trajectory_cdr(cdr_buf: bytes):
 
     # float32[] positions
     off = _cdr_align(cdr_buf, off, 4)
-    (n_pos,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    (n_pos,) = struct.unpack_from("<I", cdr_buf, off); off += 4
     off = _cdr_align(cdr_buf, off, 4)
     positions = np.frombuffer(cdr_buf, dtype=np.float32, count=n_pos, offset=off).copy()
     off += 4 * n_pos
 
     # float32[] velocities
     off = _cdr_align(cdr_buf, off, 4)
-    (n_vel,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    (n_vel,) = struct.unpack_from("<I", cdr_buf, off); off += 4
     off = _cdr_align(cdr_buf, off, 4)
     velocities = np.frombuffer(cdr_buf, dtype=np.float32, count=n_vel, offset=off).copy()
     off += 4 * n_vel
 
     # float32[] accelerations
     off = _cdr_align(cdr_buf, off, 4)
-    (n_acc,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    (n_acc,) = struct.unpack_from("<I", cdr_buf, off); off += 4
     off = _cdr_align(cdr_buf, off, 4)
     accelerations = np.frombuffer(cdr_buf, dtype=np.float32, count=n_acc, offset=off).copy()
 
@@ -229,15 +250,24 @@ def _load_holosoma_cmd_bag(bag_path: Path):
 
     stamps = []
     q_targets = []
+    n_decode_errors = 0
+    first_decode_err: Exception | None = None
     for mp in mcaps:
         with open(mp, "rb") as f:
             reader = make_reader(f)
             for _, _, msg in reader.iter_messages(topics=["/holosoma_cmd"]):
                 try:
                     stamp_ns, _names, pos, _v, _a = _decode_joint_trajectory_cdr(msg.data)
-                except Exception:
+                except Exception as exc:
                     # Bags sometimes have a malformed first/last message;
-                    # skip rather than fail the whole run.
+                    # skip rather than fail the whole run — but count
+                    # failures and surface the first one so a schema
+                    # change doesn't silently drop every frame.
+                    n_decode_errors += 1
+                    if first_decode_err is None:
+                        first_decode_err = exc
+                        print(f"  [holosoma_cmd decode] first failure: {exc!r}",
+                              file=sys.stderr)
                     continue
                 if pos.size == 0:
                     continue
@@ -248,6 +278,9 @@ def _load_holosoma_cmd_bag(bag_path: Path):
                 q_targets.append(pos.astype(np.float64))
     if not stamps:
         raise RuntimeError(f"no /holosoma_cmd messages in {bag_path}")
+    if n_decode_errors:
+        print(f"  [holosoma_cmd decode] {n_decode_errors} messages skipped "
+              f"(first error above)", file=sys.stderr)
     stamps = np.asarray(stamps, dtype=np.int64)
     # Some cmds may differ in length across frames (shouldn't, but guard).
     dof = max(q.shape[0] for q in q_targets)
@@ -277,7 +310,7 @@ def _nearest_stamp_idx(sorted_stamps, target_ns):
 # ---------------------------------------------------------------------------
 
 
-def _render_pico_panel(pose_xyz, fig_canvas, ax, init_xyz):
+def _render_pico_panel(pose_xyz, fig_canvas, ax):
     """Draw the 24-joint SMPL skeleton as a stick figure. Return RGB array."""
     import numpy as np
 
@@ -379,7 +412,14 @@ def _render_g1_pose(scene: G1Scene, q_joints, label: str,
 
     q = np.asarray(q_joints, dtype=np.float64).reshape(-1)
     if q.shape[0] != scene.n_dof:
-        # Pad/truncate defensively so a bad input doesn't crash the whole video.
+        # Pad/truncate defensively so a bad input doesn't crash the whole
+        # video, but warn the first time so a configuration drift (e.g.
+        # a 25-DOF checkpoint feeding a 29-DOF scene) isn't silent.
+        if not getattr(_render_g1_pose, "_warned_dof_mismatch", False):
+            print(f"  warning: q_joints has {q.shape[0]} DOF, scene expects "
+                  f"{scene.n_dof} — padding/truncating (further warnings suppressed).",
+                  file=sys.stderr)
+            _render_g1_pose._warned_dof_mismatch = True
         fixed = np.zeros(scene.n_dof)
         fixed[: min(scene.n_dof, q.shape[0])] = q[: min(scene.n_dof, q.shape[0])]
         q = fixed
@@ -454,8 +494,13 @@ def _draw_frame_index(img, t: int, total: int):
 
 
 class _LocalTrackingSource:
-    """Non-blocking, latest-wins source identical in contract to
-    ``_DriverTrackingSource`` in holosoma_driver.worker.
+    """Non-blocking, latest-wins ``TrackingSource`` implementation.
+
+    Conforms to the protocol defined in
+    ``holosoma_inference.policies.tracking_source.TrackingSource``:
+    ``get_latest()`` is non-blocking and returns the most recent
+    pushed payload (or ``None`` if nothing new has arrived since the
+    previous call).
     """
 
     def __init__(self):
@@ -529,9 +574,13 @@ def _build_tracking_payload(pose_xyz_quat):
 
 
 def main() -> int:
+    _set_mujoco_gl_default()
+
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mcap", type=Path, required=True,
-                   help="Path to the /pico_body_state MCAP.")
+    p.add_argument("--mcap", type=Path, default=None,
+                   help="Path to the /pico_body_state MCAP. Required "
+                   "unless --online is set (in which case pico frames "
+                   "come from the online bag).")
     p.add_argument("--onnx", type=Path, required=True,
                    help="Path to the WBT ONNX policy (e.g. models/active.onnx).")
     p.add_argument("--preset", default="g1-29dof-wbt-dense",
@@ -542,20 +591,19 @@ def main() -> int:
     p.add_argument("--fps", type=int, default=25,
                    help="Output video fps. pico is ~50 Hz; 25 fps halves it.")
     p.add_argument("--online", type=Path, default=None,
-                   help="Path to a rosbag2 MCAP captured from a live "
-                   "'pi run wbt-teleop --mujoco --bag' run, containing "
-                   "both /pico_body_state (panels 1+2 source) and "
-                   "/holosoma_cmd (panel 3). When set, --mcap is ignored "
-                   "and the online bag is the sole source for all three "
-                   "panels. Diffing the offline (no --online) vs online "
-                   "panel 3 at matched pico timestamps isolates "
-                   "ROS-pipeline error from pure policy error.")
+                   help="Path to a rosbag2 MCAP containing both "
+                   "/pico_body_state (panels 1+2 source) and "
+                   "/holosoma_cmd (panel 3) captured from a live "
+                   "deployment run. When set, --mcap is ignored and "
+                   "the online bag is the sole source for all three "
+                   "panels. Diffing the offline (no --online) vs "
+                   "online panel 3 at matched pico timestamps isolates "
+                   "runtime-pipeline error from pure policy error.")
     p.add_argument("--holosoma-reference", type=Path, default=None,
-                   help="Path to the NPZ produced by "
-                   "run_holosoma_reference_headless (the pure-holosoma "
-                   "'python -m wbt_wrappers_inference.run_policy "
-                   "inference:g1-29dof-holosoma-wbt' pipeline, "
-                   "captured via its built-in debug log). When set, a "
+                   help="Path to an NPZ produced by running the policy "
+                   "through its own headless evaluation path with "
+                   "HOLOSOMA_DEBUG_LOG set (the debug log contains per-"
+                   "frame ``action`` and ``dof_pos``). When set, a "
                    "4th panel appears showing action + default_dof "
                    "from the reference run for each frame, so you can "
                    "diff pure-holosoma output against our in-process "
@@ -564,17 +612,20 @@ def main() -> int:
 
     online_bag: Path | None = args.online
 
-    if not args.mcap.is_file():
-        print(f"error: mcap not found: {args.mcap}", file=sys.stderr)
-        return 2
-    # Online mode still needs an ONNX path for the optional offline
-    # control-panel; require only when offline.
-    if online_bag is None and not args.onnx.is_file():
-        print(f"error: onnx not found: {args.onnx}", file=sys.stderr)
-        return 2
-    if online_bag is not None and not (online_bag.is_file() or online_bag.is_dir()):
-        print(f"error: online bag not found: {online_bag}", file=sys.stderr)
-        return 2
+    if online_bag is None:
+        if args.mcap is None:
+            print("error: --mcap is required unless --online is set", file=sys.stderr)
+            return 2
+        if not args.mcap.is_file():
+            print(f"error: mcap not found: {args.mcap}", file=sys.stderr)
+            return 2
+        if not args.onnx.is_file():
+            print(f"error: onnx not found: {args.onnx}", file=sys.stderr)
+            return 2
+    else:
+        if not (online_bag.is_file() or online_bag.is_dir()):
+            print(f"error: online bag not found: {online_bag}", file=sys.stderr)
+            return 2
 
     import numpy as np
 
@@ -597,6 +648,17 @@ def main() -> int:
     if online_bag is not None:
         print(f"Reading /holosoma_cmd from {online_bag} ...", flush=True)
         online_stamps, online_q = _load_holosoma_cmd_bag(online_bag)
+        if online_q.shape[1] < 29:
+            print(f"error: /holosoma_cmd messages only carry {online_q.shape[1]} DOF; "
+                  "expected at least 29 for G1", file=sys.stderr)
+            return 2
+        if online_q.shape[1] > 29:
+            # Plausible future schema — gripper slots after the arm DOFs.
+            # The renderer pins pelvis to identity so the extra DOFs are
+            # silently dropped; warn so this isn't hidden.
+            print(f"warning: /holosoma_cmd carries {online_q.shape[1]} DOF; "
+                  "panel 3 renders the first 29 only (extras ignored).",
+                  file=sys.stderr)
         print(f"  loaded {online_stamps.shape[0]} /holosoma_cmd messages "
               f"(dof={online_q.shape[1]})", flush=True)
 
@@ -674,13 +736,12 @@ def main() -> int:
     import imageio.v3 as iio
 
     frames = []
-    n_over_limit = 0
     print(f"Rendering {poses.shape[0]} frames ...", flush=True)
     for t in range(poses.shape[0]):
         pico_pose = poses[t]
 
         # Panel 1
-        panel1 = _render_pico_panel(pico_pose[:, :3], canvas, ax3d, poses[0, :, :3])
+        panel1 = _render_pico_panel(pico_pose[:, :3], canvas, ax3d)
 
         # Panel 2: retargeted G1 pose. Use the retargeter's full qpos —
         # its mink Configuration stores [x, y, z, qw, qx, qy, qz, joints]
@@ -689,9 +750,8 @@ def main() -> int:
         # that cancels out against the retargeter's chosen root rotation).
         try:
             q_ret, _, _ = retargeter.retarget(pico_pose)
-            q_full = np.asarray(retargeter._config.q, dtype=np.float64)
-            root_pos = q_full[:3].copy()
-            root_quat_wxyz = q_full[3:7].copy()
+            root_pos = retargeter.last_root_pos.copy()
+            root_quat_wxyz = retargeter.last_root_quat_wxyz.copy()
             # Planar-anchor: center the robot so all frames sit in the
             # viewport. Preserve height so squats/stands are visible.
             root_pos[0] = 0.0
@@ -725,10 +785,13 @@ def main() -> int:
                 if t < 3:
                     print(f"  [panel3] frame {t}: policy inference failed: {exc!r}",
                           file=sys.stderr)
-            panel3_label = "WBT policy output (offline)"
+            panel3_label = "WBT policy output (offline, kinematic feedback)"
         else:
             idx = _nearest_stamp_idx(online_stamps, int(pico_stamps[t]))
-            q_wbt = online_q[idx][:29] if online_q.shape[1] >= 29 else online_q[idx]
+            # DOF >= 29 asserted at bag load time; slice guards the
+            # future-schema case where more DOFs (e.g. grippers) may
+            # follow the arm joints.
+            q_wbt = online_q[idx, :29]
             panel3_label = f"WBT /holosoma_cmd (online bag, +{(online_stamps[idx] - pico_stamps[t]) / 1e6:+.0f}ms)"
 
         panel3 = _render_g1_pose(scene_wbt, q_wbt, panel3_label)
@@ -739,18 +802,31 @@ def main() -> int:
             # if the user passed --max-frames smaller than the pico
             # length. Saturate at the last available index.
             ref_idx = min(t, ref_actions.shape[0] - 1)
-            # The policy's debug log stores ``action`` (policy-space
-            # delta). Scaled q_target = action * per_joint_scale +
-            # default_dof_angles. We don't have per_joint_scale in the
-            # NPZ, but for the shipped wbt ONNX it's ~1.0, so use
-            # action directly + default as a close approximation.
+            # q_target = action * per_joint_policy_action_scale + default_dof
+            # When we have an in-process policy handle, pull its actual
+            # scale so the rendered panel matches ``scaled_policy_action
+            # + default_dof_angles`` as the debug-log's producer
+            # computed it. Without a policy handle we can only fall
+            # back to unit scale (correct for most wbt ONNX checkpoints
+            # but worth flagging in the label).
+            ref_scale = None
             if policy is not None and hasattr(policy, "default_dof_angles"):
                 default_q = np.asarray(policy.default_dof_angles, dtype=np.float64)
+                pjs = getattr(policy, "per_joint_policy_action_scale", None)
+                if pjs is not None:
+                    ref_scale = np.asarray(pjs, dtype=np.float64).reshape(-1)
             else:
                 default_q = scene_ref.default_q
-            q_ref = ref_actions[ref_idx] + default_q[: ref_actions.shape[1]]
-            panels.append(_render_g1_pose(scene_ref, q_ref,
-                                          f"Holosoma ref (action[{ref_idx}] + default)"))
+            if ref_scale is not None and ref_scale.shape[0] >= ref_actions.shape[1]:
+                q_ref = (ref_actions[ref_idx] * ref_scale[: ref_actions.shape[1]]
+                         + default_q[: ref_actions.shape[1]])
+                label_scale = "scaled"
+            else:
+                q_ref = ref_actions[ref_idx] + default_q[: ref_actions.shape[1]]
+                label_scale = "unit-scale"
+            panels.append(_render_g1_pose(
+                scene_ref, q_ref,
+                f"Holosoma ref ({label_scale}, action[{ref_idx}] + default)"))
 
         composite = np.concatenate(panels, axis=1)
         composite = _draw_frame_index(composite, t, poses.shape[0])
@@ -763,8 +839,6 @@ def main() -> int:
     print(f"Writing {args.out} ...", flush=True)
     iio.imwrite(args.out, frames, fps=args.fps, codec="libx264")
     print(f"  wrote {args.out}")
-    if n_over_limit:
-        print(f"  over-limit retargeted frames: {n_over_limit}/{len(frames)}")
 
     scene_retarget.renderer.close()
     scene_wbt.renderer.close()
