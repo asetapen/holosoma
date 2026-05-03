@@ -548,6 +548,16 @@ def main() -> int:
                    "panels. Diffing the offline (no --online) vs online "
                    "panel 3 at matched pico timestamps isolates "
                    "ROS-pipeline error from pure policy error.")
+    p.add_argument("--holosoma-reference", type=Path, default=None,
+                   help="Path to the NPZ produced by "
+                   "run_holosoma_reference_headless (the pure-holosoma "
+                   "'python -m wbt_wrappers_inference.run_policy "
+                   "inference:g1-29dof-holosoma-wbt' pipeline, "
+                   "captured via its built-in debug log). When set, a "
+                   "4th panel appears showing action + default_dof "
+                   "from the reference run for each frame, so you can "
+                   "diff pure-holosoma output against our in-process "
+                   "WBT output and the ROS-bag /holosoma_cmd.")
     args = p.parse_args()
 
     online_bag: Path | None = args.online
@@ -588,6 +598,22 @@ def main() -> int:
         print(f"  loaded {online_stamps.shape[0]} /holosoma_cmd messages "
               f"(dof={online_q.shape[1]})", flush=True)
 
+    # Load the pure-holosoma reference debug NPZ if provided. The policy's
+    # internal debug log stores per-frame ``action`` (policy delta from
+    # default DOF) so the rendered q_target is
+    # ``action * per_joint_scale + default_dof_angles``. We don't have
+    # per_joint_scale in the debug NPZ though, so we use the ONNX
+    # metadata's action_scale if present, else fall back to identity
+    # (action ≈ scaled_action for most runs).
+    ref_actions = None
+    if args.holosoma_reference is not None:
+        print(f"Reading holosoma reference debug {args.holosoma_reference} ...",
+              flush=True)
+        ref_d = np.load(args.holosoma_reference)
+        ref_actions = np.asarray(ref_d["action"], dtype=np.float64)
+        print(f"  {ref_actions.shape[0]} reference actions, DOF={ref_actions.shape[1]}",
+              flush=True)
+
     # ── Build panel 1 figure ──────────────────────────────────────────
     import matplotlib
 
@@ -609,6 +635,7 @@ def main() -> int:
     retargeter = SMPLRetargeter(str(mjcf), max_ik_iters=4)
     scene_retarget = _build_g1_scene()
     scene_wbt = _build_g1_scene()
+    scene_ref = _build_g1_scene() if ref_actions is not None else None
 
     # ── Build panel 3 policy (WBT, offline) — skipped in --online mode ─
     policy = None
@@ -704,7 +731,26 @@ def main() -> int:
 
         panel3 = _render_g1_pose(scene_wbt, q_wbt, panel3_label)
 
-        composite = np.concatenate([panel1, panel2, panel3], axis=1)
+        panels = [panel1, panel2, panel3]
+        if scene_ref is not None:
+            # Holosoma reference NPZ may be shorter than the pico clip
+            # if the user passed --max-frames smaller than the pico
+            # length. Saturate at the last available index.
+            ref_idx = min(t, ref_actions.shape[0] - 1)
+            # The policy's debug log stores ``action`` (policy-space
+            # delta). Scaled q_target = action * per_joint_scale +
+            # default_dof_angles. We don't have per_joint_scale in the
+            # NPZ, but for the shipped wbt ONNX it's ~1.0, so use
+            # action directly + default as a close approximation.
+            if policy is not None and hasattr(policy, "default_dof_angles"):
+                default_q = np.asarray(policy.default_dof_angles, dtype=np.float64)
+            else:
+                default_q = scene_ref.default_q
+            q_ref = ref_actions[ref_idx] + default_q[: ref_actions.shape[1]]
+            panels.append(_render_g1_pose(scene_ref, q_ref,
+                                          f"Holosoma ref (action[{ref_idx}] + default)"))
+
+        composite = np.concatenate(panels, axis=1)
         composite = _draw_frame_index(composite, t, poses.shape[0])
         frames.append(composite)
 
@@ -720,6 +766,8 @@ def main() -> int:
 
     scene_retarget.renderer.close()
     scene_wbt.renderer.close()
+    if scene_ref is not None:
+        scene_ref.renderer.close()
     return 0
 
 
