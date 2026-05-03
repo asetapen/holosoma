@@ -291,10 +291,18 @@ class SMPLRetargeter:
         tasks = [t for t, _ in self._frame_tasks] + [self._posture_task]
         limits = [self._config_limit]
 
+        # Tolerance for early-exit: default 1e-4 is tight (~0.0006 deg
+        # per iter at dt=0.1). Relaxing to 1e-3 or 1e-2 typically lets
+        # "converged enough" frames exit after 1-2 iters while hard
+        # frames can still use the full budget. Env-tunable so we can
+        # measure the quality/speed tradeoff separately from iter count.
+        import os as _os
+
+        tol = float(_os.environ.get("HOLOSOMA_RETARGETER_IK_TOL", "1e-4") or 1e-4)
         for _ in range(self._max_ik_iters):
             vel = mink.solve_ik(self._config, tasks, dt=0.1, solver="daqp", damping=1e-4, limits=limits)
             self._config.integrate_inplace(vel, 0.1)
-            if np.linalg.norm(vel) < 1e-4:
+            if np.linalg.norm(vel) < tol:
                 break
 
         return self._config.q.copy()
