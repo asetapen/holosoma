@@ -89,20 +89,185 @@ def _decode_pico_body_joint_poses(cdr_buf: bytes):
 
 
 def _load_pico_frames(mcap_path: Path, max_frames: int | None):
-    from mcap.reader import make_reader
+    """Load /pico_body_state frames from an MCAP file or rosbag2 dir.
 
-    poses = []
-    with open(mcap_path, "rb") as f:
-        reader = make_reader(f)
-        for _, _, msg in reader.iter_messages(topics=["/pico_body_state"]):
-            if len(msg.data) < 4 + 168 * 8:
-                continue
-            poses.append(_decode_pico_body_joint_poses(msg.data))
-            if max_frames is not None and len(poses) >= max_frames:
-                break
+    Returns (poses (T, 24, 7), stamps_ns (T,)). stamps use ``log_time``
+    so the online-mode cross-reference to /holosoma_cmd works on the
+    same clock.
+    """
+    from mcap.reader import make_reader
     import numpy as np
 
-    return np.stack(poses, axis=0) if poses else np.zeros((0, 24, 7))
+    mcaps: list[Path]
+    if Path(mcap_path).is_dir():
+        mcaps = sorted(Path(mcap_path).glob("*.mcap"))
+        if not mcaps:
+            raise FileNotFoundError(f"no .mcap files under {mcap_path}")
+    else:
+        mcaps = [Path(mcap_path)]
+
+    poses = []
+    times_ns = []
+    for mp in mcaps:
+        with open(mp, "rb") as f:
+            reader = make_reader(f)
+            for _, _, msg in reader.iter_messages(topics=["/pico_body_state"]):
+                if len(msg.data) < 4 + 168 * 8:
+                    continue
+                poses.append(_decode_pico_body_joint_poses(msg.data))
+                times_ns.append(msg.log_time)
+                if max_frames is not None and len(poses) >= max_frames:
+                    break
+        if max_frames is not None and len(poses) >= max_frames:
+            break
+
+    if not poses:
+        return np.zeros((0, 24, 7)), np.zeros((0,), dtype=np.int64)
+    return np.stack(poses, axis=0), np.asarray(times_ns, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
+# Online-mode rosbag parser
+# ---------------------------------------------------------------------------
+
+
+def _cdr_align(buf: bytes, off: int, boundary: int) -> int:
+    """CDR padding: round ``off`` up to the next ``boundary``. The encoding
+    header is 4 bytes; alignment inside the payload is relative to (off - 4).
+    """
+    payload_off = off - 4
+    pad = (-payload_off) % boundary
+    return off + pad
+
+
+def _cdr_read_string(buf: bytes, off: int) -> tuple[str, int]:
+    off = _cdr_align(buf, off, 4)
+    import struct as _s
+
+    (n,) = _s.unpack_from("<I", buf, off)
+    off += 4
+    # n includes the trailing NUL
+    s = buf[off : off + n - 1].decode("utf-8", errors="replace")
+    off += n
+    return s, off
+
+
+def _decode_joint_trajectory_cdr(cdr_buf: bytes):
+    """Decode a holosoma_msgs/JointTrajectory CDR payload.
+
+    Layout (post 4-byte encapsulation header):
+        Header
+            uint32 sec            # CDR stores builtin_interfaces/Time
+            uint32 nanosec        # as two uint32s on ROS 2 Jazzy
+            string frame_id
+        string[] joint_names
+        float32[] positions
+        float32[] velocities
+        float32[] accelerations
+    Returns (stamp_ns, joint_names, positions, velocities, accelerations).
+    """
+    import struct as _s
+
+    import numpy as np
+
+    off = 4  # skip encapsulation header
+    off = _cdr_align(cdr_buf, off, 4)
+    (sec,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    (nanosec,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    stamp_ns = int(sec) * 1_000_000_000 + int(nanosec)
+    _frame_id, off = _cdr_read_string(cdr_buf, off)
+
+    # string[] joint_names
+    off = _cdr_align(cdr_buf, off, 4)
+    (n_names,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    names = []
+    for _ in range(n_names):
+        s, off = _cdr_read_string(cdr_buf, off)
+        names.append(s)
+
+    # float32[] positions
+    off = _cdr_align(cdr_buf, off, 4)
+    (n_pos,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    off = _cdr_align(cdr_buf, off, 4)
+    positions = np.frombuffer(cdr_buf, dtype=np.float32, count=n_pos, offset=off).copy()
+    off += 4 * n_pos
+
+    # float32[] velocities
+    off = _cdr_align(cdr_buf, off, 4)
+    (n_vel,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    off = _cdr_align(cdr_buf, off, 4)
+    velocities = np.frombuffer(cdr_buf, dtype=np.float32, count=n_vel, offset=off).copy()
+    off += 4 * n_vel
+
+    # float32[] accelerations
+    off = _cdr_align(cdr_buf, off, 4)
+    (n_acc,) = _s.unpack_from("<I", cdr_buf, off); off += 4
+    off = _cdr_align(cdr_buf, off, 4)
+    accelerations = np.frombuffer(cdr_buf, dtype=np.float32, count=n_acc, offset=off).copy()
+
+    return stamp_ns, names, positions, velocities, accelerations
+
+
+def _load_holosoma_cmd_bag(bag_path: Path):
+    """Read a rosbag2 MCAP and return sorted (stamps_ns, q_targets) arrays.
+
+    Handles both ``bag.mcap`` direct path and rosbag2 directories (scans
+    for *.mcap inside).
+    """
+    from mcap.reader import make_reader
+    import numpy as np
+
+    mcaps: list[Path]
+    if bag_path.is_dir():
+        mcaps = sorted(bag_path.glob("*.mcap"))
+        if not mcaps:
+            raise FileNotFoundError(f"no .mcap files under {bag_path}")
+    else:
+        mcaps = [bag_path]
+
+    stamps = []
+    q_targets = []
+    for mp in mcaps:
+        with open(mp, "rb") as f:
+            reader = make_reader(f)
+            for _, _, msg in reader.iter_messages(topics=["/holosoma_cmd"]):
+                try:
+                    stamp_ns, _names, pos, _v, _a = _decode_joint_trajectory_cdr(msg.data)
+                except Exception:
+                    # Bags sometimes have a malformed first/last message;
+                    # skip rather than fail the whole run.
+                    continue
+                if pos.size == 0:
+                    continue
+                # Prefer stamp from header; fall back to log_time.
+                if stamp_ns <= 0:
+                    stamp_ns = int(msg.log_time)
+                stamps.append(stamp_ns)
+                q_targets.append(pos.astype(np.float64))
+    if not stamps:
+        raise RuntimeError(f"no /holosoma_cmd messages in {bag_path}")
+    stamps = np.asarray(stamps, dtype=np.int64)
+    # Some cmds may differ in length across frames (shouldn't, but guard).
+    dof = max(q.shape[0] for q in q_targets)
+    q_arr = np.zeros((len(q_targets), dof), dtype=np.float64)
+    for i, q in enumerate(q_targets):
+        q_arr[i, : q.shape[0]] = q
+    order = np.argsort(stamps)
+    return stamps[order], q_arr[order]
+
+
+def _nearest_stamp_idx(sorted_stamps, target_ns):
+    """Find index in ``sorted_stamps`` closest to ``target_ns``."""
+    import numpy as np
+
+    i = int(np.searchsorted(sorted_stamps, target_ns))
+    if i == 0:
+        return 0
+    if i >= len(sorted_stamps):
+        return len(sorted_stamps) - 1
+    if abs(sorted_stamps[i - 1] - target_ns) <= abs(sorted_stamps[i] - target_ns):
+        return i - 1
+    return i
 
 
 # ---------------------------------------------------------------------------
@@ -374,21 +539,29 @@ def main() -> int:
                    help="Stop after this many pico frames (0 = full MCAP).")
     p.add_argument("--fps", type=int, default=25,
                    help="Output video fps. pico is ~50 Hz; 25 fps halves it.")
-    p.add_argument("--online", action="store_true",
-                   help="Run the full ROS pipeline (pi run wbt-teleop) to "
-                   "produce panel 3 instead of the offline in-process policy. "
-                   "NOT YET IMPLEMENTED.")
+    p.add_argument("--online", type=Path, default=None,
+                   help="Path to a rosbag2 MCAP captured from a live "
+                   "'pi run wbt-teleop --mujoco --bag' run, containing "
+                   "both /pico_body_state (panels 1+2 source) and "
+                   "/holosoma_cmd (panel 3). When set, --mcap is ignored "
+                   "and the online bag is the sole source for all three "
+                   "panels. Diffing the offline (no --online) vs online "
+                   "panel 3 at matched pico timestamps isolates "
+                   "ROS-pipeline error from pure policy error.")
     args = p.parse_args()
 
-    if args.online:
-        print("error: --online mode is not yet implemented", file=sys.stderr)
-        return 2
+    online_bag: Path | None = args.online
 
     if not args.mcap.is_file():
         print(f"error: mcap not found: {args.mcap}", file=sys.stderr)
         return 2
-    if not args.onnx.is_file():
+    # Online mode still needs an ONNX path for the optional offline
+    # control-panel; require only when offline.
+    if online_bag is None and not args.onnx.is_file():
         print(f"error: onnx not found: {args.onnx}", file=sys.stderr)
+        return 2
+    if online_bag is not None and not (online_bag.is_file() or online_bag.is_dir()):
+        print(f"error: online bag not found: {online_bag}", file=sys.stderr)
         return 2
 
     import numpy as np
@@ -396,13 +569,24 @@ def main() -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     # ── Load pico frames ──────────────────────────────────────────────
-    print(f"Reading {args.mcap} ...", flush=True)
+    # In --online mode, pico frames come from the online bag itself so the
+    # timestamps align with its /holosoma_cmd stream.
+    pico_source = online_bag if online_bag is not None else args.mcap
+    print(f"Reading pico frames from {pico_source} ...", flush=True)
     max_frames = args.max_frames if args.max_frames > 0 else None
-    poses = _load_pico_frames(args.mcap, max_frames)
+    poses, pico_stamps = _load_pico_frames(pico_source, max_frames)
     if poses.shape[0] == 0:
         print("no /pico_body_state frames", file=sys.stderr)
         return 2
     print(f"  loaded {poses.shape[0]} frames", flush=True)
+
+    online_stamps = None
+    online_q = None
+    if online_bag is not None:
+        print(f"Reading /holosoma_cmd from {online_bag} ...", flush=True)
+        online_stamps, online_q = _load_holosoma_cmd_bag(online_bag)
+        print(f"  loaded {online_stamps.shape[0]} /holosoma_cmd messages "
+              f"(dof={online_q.shape[1]})", flush=True)
 
     # ── Build panel 1 figure ──────────────────────────────────────────
     import matplotlib
@@ -426,29 +610,36 @@ def main() -> int:
     scene_retarget = _build_g1_scene()
     scene_wbt = _build_g1_scene()
 
-    # ── Build panel 3 policy (WBT, offline) ───────────────────────────
-    print(f"Constructing WBT policy (preset={args.preset}) ...", flush=True)
-    tracking = _LocalTrackingSource()
-    policy = _build_wbt_policy(str(args.onnx), args.preset, tracking)
+    # ── Build panel 3 policy (WBT, offline) — skipped in --online mode ─
+    policy = None
+    tracking = None
+    robot_state = None
+    num_dofs = 29
+    if online_bag is None:
+        print(f"Constructing WBT policy (preset={args.preset}) ...", flush=True)
+        tracking = _LocalTrackingSource()
+        policy = _build_wbt_policy(str(args.onnx), args.preset, tracking)
 
-    # robot_state_data shape: (1, 7 + num_dofs + 6 + num_dofs [+ 3])
-    #   base_pos(3) + base_quat(4) + dof_pos + base_lin_vel(3) + base_ang_vel(3) + dof_vel
-    num_dofs = policy.num_dofs
-    base_obs_len = 7 + num_dofs + 6 + num_dofs
-    robot_state = np.zeros((1, base_obs_len), dtype=np.float64)
-    # upright base quat (wxyz)
-    robot_state[0, 3] = 1.0
-    # Prime dof_pos at the default angles so the policy's "dof_pos - default"
-    # starts at zero on frame 0.
-    robot_state[0, 7 : 7 + num_dofs] = policy.default_dof_angles
+        # robot_state_data shape: (1, 7 + num_dofs + 6 + num_dofs [+ 3])
+        # base_pos(3) + base_quat(4) + dof_pos + base_lin_vel(3) + base_ang_vel(3) + dof_vel
+        num_dofs = policy.num_dofs
+        base_obs_len = 7 + num_dofs + 6 + num_dofs
+        robot_state = np.zeros((1, base_obs_len), dtype=np.float64)
+        # upright base quat (wxyz)
+        robot_state[0, 3] = 1.0
+        # Prime dof_pos at the default angles so the policy's "dof_pos - default"
+        # starts at zero on frame 0.
+        robot_state[0, 7 : 7 + num_dofs] = policy.default_dof_angles
 
-    # The policy's start() path wires ``use_policy_action = True`` only after
-    # a StateCommand.START. Call the same helper the driver's autostart does.
-    try:
-        from holosoma_inference.inputs.api.commands import StateCommand
-        policy._dispatch_command(StateCommand.START)
-    except Exception as exc:
-        print(f"warning: policy start dispatch failed: {exc}", file=sys.stderr)
+        # The policy's start() path wires ``use_policy_action = True`` only after
+        # a StateCommand.START. Call the same helper the driver's autostart does.
+        try:
+            from holosoma_inference.inputs.api.commands import StateCommand
+            policy._dispatch_command(StateCommand.START)
+        except Exception as exc:
+            print(f"warning: policy start dispatch failed: {exc}", file=sys.stderr)
+    else:
+        print("Skipping in-process WBT policy construction (--online mode).", flush=True)
 
     # ── Render loop ───────────────────────────────────────────────────
     import imageio.v3 as iio
@@ -488,25 +679,30 @@ def main() -> int:
                                  root_pos=root_pos,
                                  root_quat_wxyz=root_quat_wxyz)
 
-        # Panel 3: WBT policy output
-        payload = _build_tracking_payload(pico_pose)
-        tracking.push(payload)
-        # Update dof_pos in the fake robot_state to the *last* policy output
-        # so observations evolve coherently frame-to-frame. On frame 0
-        # this is default_q; on frame t > 0 it's the previous q_target.
-        try:
-            action = policy.rl_inference(robot_state)
-            q_wbt = np.asarray(action[0]) + policy.default_dof_angles
-            # Feed back: next frame's observations see the command we
-            # just issued.
-            robot_state[0, 7 : 7 + num_dofs] = q_wbt
-        except Exception as exc:
-            q_wbt = policy.default_dof_angles.copy()
-            if t < 3:
-                print(f"  [panel3] frame {t}: policy inference failed: {exc!r}",
-                      file=sys.stderr)
+        # Panel 3: WBT output. Offline path runs the policy in-process;
+        # online path nearest-neighbours the pico frame timestamp into
+        # the pre-recorded /holosoma_cmd stream.
+        if online_bag is None:
+            payload = _build_tracking_payload(pico_pose)
+            tracking.push(payload)
+            try:
+                action = policy.rl_inference(robot_state)
+                q_wbt = np.asarray(action[0]) + policy.default_dof_angles
+                # Feed back: next frame's observations see the command
+                # we just issued, so obs evolve coherently frame-to-frame.
+                robot_state[0, 7 : 7 + num_dofs] = q_wbt
+            except Exception as exc:
+                q_wbt = policy.default_dof_angles.copy()
+                if t < 3:
+                    print(f"  [panel3] frame {t}: policy inference failed: {exc!r}",
+                          file=sys.stderr)
+            panel3_label = "WBT policy output (offline)"
+        else:
+            idx = _nearest_stamp_idx(online_stamps, int(pico_stamps[t]))
+            q_wbt = online_q[idx][:29] if online_q.shape[1] >= 29 else online_q[idx]
+            panel3_label = f"WBT /holosoma_cmd (online bag, +{(online_stamps[idx] - pico_stamps[t]) / 1e6:+.0f}ms)"
 
-        panel3 = _render_g1_pose(scene_wbt, q_wbt, "WBT policy output")
+        panel3 = _render_g1_pose(scene_wbt, q_wbt, panel3_label)
 
         composite = np.concatenate([panel1, panel2, panel3], axis=1)
         composite = _draw_frame_index(composite, t, poses.shape[0])
