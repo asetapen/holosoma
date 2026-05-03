@@ -15,16 +15,18 @@ Panels are rendered independently, horizontally concatenated.
   ``policy.rl_inference`` directly and take ``scaled_policy_action +
   default_dof_angles`` as the per-frame q_target.
 
-Usage (host-side, all deps present in ~/lab42 Python):
+Usage (requires mujoco, mcap, matplotlib, imageio, pinocchio, and the
+holosoma_inference + holosoma_retargeting packages on the Python path):
 
-    python3 holosoma_extensions/scripts/three_panel_eval.py \\
-        --mcap holosoma_extensions/test_data/pico_example_long.mcap \\
-        --onnx holosoma_extensions/models/active.onnx \\
-        --out  /tmp/three_panel/three_panel.mp4
+    python3 three_panel_eval.py \\
+        --mcap path/to/pico_recording.mcap \\
+        --onnx path/to/wbt_policy.onnx \\
+        --out  /tmp/three_panel.mp4
 
-The --online mode (not implemented yet) will re-run through the full
-ROS pipeline (pi run wbt-teleop --mujoco --bag) to isolate ROS-induced
-error from pure-policy error.
+The --online flag reads a pre-recorded rosbag2 MCAP containing
+/holosoma_cmd and renders panel 3 from those timestamps instead of
+running the policy in-process. Diffing offline vs online panel 3
+isolates runtime-pipeline error from pure-policy error.
 """
 
 from __future__ import annotations

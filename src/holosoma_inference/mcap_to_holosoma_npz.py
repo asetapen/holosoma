@@ -14,10 +14,10 @@ Pipeline:
     4. MuJoCo FK over the G1 29-DOF scene → 32 body poses
     5. np.savez
 
-Usage (inside bazel):
-    bazel run //...:mcap_to_holosoma_npz -- \\
-        --mcap /home/devuser/far_pi/holosoma_extensions/test_data/pico_example_long.mcap \\
-        --out  /tmp/pico_example_long.ref.npz
+Usage:
+    python3 mcap_to_holosoma_npz.py \\
+        --mcap path/to/pico_recording.mcap \\
+        --out  path/to/ref_motion.npz
 """
 
 from __future__ import annotations
