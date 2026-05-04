@@ -63,29 +63,54 @@ def _build_dual_g1_mjcf(g1_xml_path: Path, offset: float = 0.8) -> str:
         out = xml
         for a in attrs:
             out = re.sub(rf'{a}="([^"]+)"', lambda m, a=a: f'{a}="{m.group(1)}{suffix}"', out)
+        # Name the freejoint so we can address its qpos via mj_name2id later.
+        # MJCF allows bare `<freejoint/>`; MuJoCo gives those an empty name,
+        # so suffix_names above doesn't catch them.
+        out = out.replace("<freejoint/>", f'<freejoint name="root{suffix}"/>')
         return out
 
-    # Extract the <worldbody> contents and the rest (defaults, assets, ...)
-    # Everything outside <worldbody> is shared (assets, defaults); inside
-    # must be duplicated and renamed.
+    # Strip the ground plane / worldbody lights from the per-copy template so
+    # the two copies don't spawn duplicate planes/lights. We keep one shared
+    # copy in the combined <worldbody>.
     m_open = raw.find("<worldbody>")
     m_close = raw.find("</worldbody>")
     if m_open < 0 or m_close < 0:
         raise RuntimeError(f"G1 MJCF {g1_xml_path} missing <worldbody>")
     prefix = raw[:m_open]
     worldbody_inner = raw[m_open + len("<worldbody>") : m_close]
-    suffix = raw[m_close + len("</worldbody>") :]
+    trailer = raw[m_close + len("</worldbody>") :]
 
-    cmd = suffix_names(worldbody_inner, "_cmd")
-    act = suffix_names(worldbody_inner, "_act")
+    # Drop any top-level <geom type="plane" .../> and <light .../> from the
+    # per-copy worldbody so the combined scene has only one of each.
+    template_for_copies = re.sub(r'<geom\s+type="plane"[^/]*/>', "", worldbody_inner)
+    template_for_copies = re.sub(r"<light[^/]*/>", "", template_for_copies)
 
-    # We prepend each copy with a position offset by wrapping the top-level
-    # <body> in the worldbody. The G1 root body is typically the first
-    # <body>. Cheaper: leave the model untouched and apply offset via the
-    # freejoint qpos[0:3] at runtime. MuJoCo still requires the body tree
-    # to have no name collisions — suffixing covers that.
-    dual_worldbody = f"<worldbody>\n{cmd}\n{act}\n</worldbody>"
-    return prefix + dual_worldbody + suffix
+    cmd = suffix_names(template_for_copies, "_cmd")
+    act = suffix_names(template_for_copies, "_act")
+
+    # The first <body ...> in each copy is the pelvis (root). Inject a
+    # pos= attribute on it so the freejoint stays a direct worldbody child
+    # (MuJoCo requires this). pos is the freejoint's reference frame; with
+    # qpos at identity the pelvis sits at (±offset, 0, 0.793).
+    def set_root_pos(xml: str, x: float) -> str:
+        return re.sub(
+            r"<body(\s[^>]*?name=\"pelvis[^\"]*\"[^>]*)>",
+            lambda m: f'<body{m.group(1)} pos="{x} 0 0.793">',
+            xml,
+            count=1,
+        )
+
+    cmd_positioned = set_root_pos(cmd, -offset)
+    act_positioned = set_root_pos(act, +offset)
+
+    # Shared ground + light + an explicit camera framing both copies.
+    shared_scene = (
+        '<geom type="plane" size="4 4 0.1" rgba="0.2 0.3 0.4 1"/>'
+        '<light pos="0 0 4" castshadow="true"/>'
+        '<camera name="dual_view" pos="0 -3.0 1.5" xyaxes="1 0 0 0 0.5 0.866" mode="fixed"/>'
+    )
+    dual_worldbody = f"<worldbody>\n{shared_scene}\n{cmd_positioned}\n{act_positioned}\n</worldbody>"
+    return prefix + dual_worldbody + trailer
 
 
 def _resolve_dof_qpos_addrs(model, suffix: str) -> tuple[list[int], list[str]]:
@@ -214,14 +239,9 @@ def _run_viewer(shm_name: str, offset: float, diff_report_hz: float):
 
     cmd_qpos, dof_names = _resolve_dof_qpos_addrs(model, "_cmd")
     act_qpos, _ = _resolve_dof_qpos_addrs(model, "_act")
-    cmd_free = _resolve_freejoint_qpos(model, "_cmd")
-    act_free = _resolve_freejoint_qpos(model, "_act")
-    if cmd_free is not None:
-        data.qpos[cmd_free + 0 : cmd_free + 3] = [-offset, 0.0, 0.793]
-        data.qpos[cmd_free + 3 : cmd_free + 7] = [1.0, 0.0, 0.0, 0.0]
-    if act_free is not None:
-        data.qpos[act_free + 0 : act_free + 3] = [+offset, 0.0, 0.793]
-        data.qpos[act_free + 3 : act_free + 7] = [1.0, 0.0, 0.0, 0.0]
+    # Freejoint qpos stays at identity — the side-by-side offset is baked
+    # into the frame_cmd/frame_act wrapper bodies in the MJCF, so the
+    # pelvis sits at the frame origin (offset, 0, 0.793) by construction.
     mujoco.mj_kinematics(model, data)
 
     reader = _PolicyOutputShmReader(num_dofs=len(cmd_qpos), shm_name=shm_name)

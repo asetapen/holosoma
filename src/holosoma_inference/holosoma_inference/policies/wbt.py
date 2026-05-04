@@ -26,6 +26,61 @@ from holosoma_inference.utils.math.quat import (
 )
 
 
+class _InlinePolicyOutputShmWriter:
+    """Inlined writer for the `holosoma_policy_output` SHM segment.
+
+    Mirrors holosoma_ext_viser.skeleton_shm.PolicyOutputShmWriter byte-for-
+    byte. Inlined here so the bazel-built inference binary publishes the
+    (q_target, dof_pos) stream without a dep on holosoma_ext_viser, which
+    is pip-only. Layout must stay in sync with _PolicyOutputShmReader in
+    policy_output_viewer.py.
+    """
+
+    _HEADER_SIZE = 8
+
+    def __init__(self, num_dofs: int = 29, shm_name: str = "holosoma_policy_output") -> None:
+        import struct as _struct
+        from multiprocessing import shared_memory
+
+        self._struct = _struct
+        self._shm_name = shm_name
+        self._num_dofs = num_dofs
+        joint_size = num_dofs * 8
+        self._total_size = self._HEADER_SIZE + 2 * joint_size
+
+        try:
+            old = shared_memory.SharedMemory(name=shm_name, create=False)
+            old.close()
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
+        self._shm = shared_memory.SharedMemory(name=shm_name, create=True, size=self._total_size)
+        off = self._HEADER_SIZE
+        self._q_target = np.ndarray((num_dofs,), dtype=np.float64, buffer=self._shm.buf[off : off + joint_size])
+        off += joint_size
+        self._dof_pos = np.ndarray((num_dofs,), dtype=np.float64, buffer=self._shm.buf[off : off + joint_size])
+        self._q_target[:] = 0.0
+        self._dof_pos[:] = 0.0
+
+    def write(self, q_target: np.ndarray, dof_pos: np.ndarray) -> None:
+        import time as _time
+
+        self._q_target[:] = q_target
+        self._dof_pos[:] = dof_pos
+        self._struct.pack_into("d", self._shm.buf, 0, _time.monotonic())
+
+    def close(self) -> None:
+        try:
+            self._shm.close()
+        except Exception:
+            pass
+        try:
+            self._shm.unlink()
+        except Exception:
+            pass
+
+
 class WholeBodyTrackingPolicy(BasePolicy):
     def __init__(self, config: InferenceConfig, tracking_source: TrackingSource | None = None):
         self.config = config
@@ -191,6 +246,27 @@ class WholeBodyTrackingPolicy(BasePolicy):
             return action, motion_command, ref_quat_xyzw
 
         self.policy = policy_act
+
+        # Shared-memory publisher for the side-by-side policy_output_viewer.
+        # Best-effort — the policy runs unchanged if shm creation fails.
+        self._policy_shm_writer = None
+        try:
+            self._policy_shm_writer = _InlinePolicyOutputShmWriter(num_dofs=self.num_dofs)
+            import atexit as _atexit
+
+            _atexit.register(self._cleanup_policy_shm)
+            logger.info("Policy-output shared memory publisher started (holosoma_policy_output)")
+        except Exception as e:
+            logger.warning("Failed to start policy-output shared memory writer: {}", e)
+
+    def _cleanup_policy_shm(self):
+        w = getattr(self, "_policy_shm_writer", None)
+        if w is not None:
+            try:
+                w.close()
+            except Exception:
+                pass
+            self._policy_shm_writer = None
 
     def _capture_policy_state(self):
         state = super()._capture_policy_state()
@@ -365,6 +441,19 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.scaled_policy_action = policy_action * self.policy_action_scale
         else:
             self.scaled_policy_action = policy_action * self.per_joint_policy_action_scale
+
+        # Publish (q_target, dof_pos) to shared memory for policy_output_viewer.
+        # q_target is the commanded set-point pre-Dampener; dof_pos is the
+        # robot readback. Both in the policy's joint order (matches the ONNX
+        # dof_names). Best-effort; shape mismatches bail silently.
+        if getattr(self, "_policy_shm_writer", None) is not None:
+            try:
+                q_target_pub = (self.scaled_policy_action + self.default_dof_angles).reshape(-1).astype(np.float64)
+                dof_pos_pub = robot_state_data[0, 7 : 7 + self.num_dofs].astype(np.float64)
+                self._policy_shm_writer.write(q_target_pub, dof_pos_pub)
+            except Exception as _e:
+                logger.debug("policy-output shm write failed: {}", _e)
+
         # update motion timestep
         self._set_motion_timestep()
         if _dbg and len(_ts) > 1:
