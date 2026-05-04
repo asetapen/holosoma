@@ -347,7 +347,14 @@ def _render_pico_panel(pose_xyz, fig_canvas, ax):
     ax.set_box_aspect((1, 1, 1.6))
     ax.set_title("Pico skeleton (SMPL-24)", color="white")
     ax.set_facecolor("black")
-    ax.view_init(elev=15, azim=-135)
+    # Match the MuJoCo panel cameras (azimuth=135, elevation=-15 in
+    # mujoco convention). matplotlib's ``elev`` is the angle above the
+    # XY plane of the camera position (positive = looking down);
+    # mujoco's ``elevation`` is the pitch of the look-direction
+    # (negative = looking down). So a mujoco elevation of -15 pairs
+    # with a matplotlib elev of +15. Azimuth has the same convention
+    # in both (degrees CCW around +Z from +X).
+    ax.view_init(elev=15, azim=135)
     ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis.pane.fill = False
