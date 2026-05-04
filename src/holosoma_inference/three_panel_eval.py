@@ -662,21 +662,30 @@ def main() -> int:
         print(f"  loaded {online_stamps.shape[0]} /holosoma_cmd messages "
               f"(dof={online_q.shape[1]})", flush=True)
 
-    # Load the pure-holosoma reference debug NPZ if provided. The policy's
-    # internal debug log stores per-frame ``action`` (policy delta from
-    # default DOF) so the rendered q_target is
-    # ``action * per_joint_scale + default_dof_angles``. We don't have
-    # per_joint_scale in the debug NPZ though, so we use the ONNX
-    # metadata's action_scale if present, else fall back to identity
-    # (action ≈ scaled_action for most runs).
-    ref_actions = None
+    # Load the pure-holosoma reference debug NPZ if provided. Prefer
+    # ``dof_pos`` (the actual post-PD sim state) over ``action``: the raw
+    # action values are ONNX-space deltas that get PD-smoothed by the
+    # MuJoCo interface, so rendering ``action + default_dof`` directly
+    # produces kinematically-extreme poses that don't reflect what the
+    # policy actually achieved. ``dof_pos`` is the ground-truth
+    # trajectory the policy executed.
+    ref_dof_pos = None
     if args.holosoma_reference is not None:
         print(f"Reading holosoma reference debug {args.holosoma_reference} ...",
               flush=True)
         ref_d = np.load(args.holosoma_reference)
-        ref_actions = np.asarray(ref_d["action"], dtype=np.float64)
-        print(f"  {ref_actions.shape[0]} reference actions, DOF={ref_actions.shape[1]}",
-              flush=True)
+        if "dof_pos" in ref_d.files:
+            ref_dof_pos = np.asarray(ref_d["dof_pos"], dtype=np.float64)
+            print(f"  {ref_dof_pos.shape[0]} reference dof_pos frames, "
+                  f"DOF={ref_dof_pos.shape[1]}", flush=True)
+        else:
+            # Fallback for older debug NPZs without dof_pos (action + default
+            # gives the commanded set-point, not the achieved state — less
+            # faithful but still informative).
+            ref_dof_pos = np.asarray(ref_d["action"], dtype=np.float64)
+            print(f"  WARN: debug NPZ has no 'dof_pos'; falling back to "
+                  f"'action' (commanded set-point, not achieved state).",
+                  file=sys.stderr)
 
     # ── Build panel 1 figure ──────────────────────────────────────────
     import matplotlib
@@ -699,7 +708,7 @@ def main() -> int:
     retargeter = SMPLRetargeter(str(mjcf), max_ik_iters=4)
     scene_retarget = _build_g1_scene()
     scene_wbt = _build_g1_scene()
-    scene_ref = _build_g1_scene() if ref_actions is not None else None
+    scene_ref = _build_g1_scene() if ref_dof_pos is not None else None
 
     # ── Build panel 3 policy (WBT, offline) — skipped in --online mode ─
     policy = None
@@ -781,17 +790,30 @@ def main() -> int:
                                  root_pos=root_pos,
                                  root_quat_wxyz=root_quat_wxyz)
 
-        # Panel 3: WBT output. Offline path runs the policy in-process;
-        # online path nearest-neighbours the pico frame timestamp into
-        # the pre-recorded /holosoma_cmd stream.
-        if online_bag is None:
+        # Panel 3: WBT output. Sources, in priority order:
+        #   (a) --online bag  → nearest /holosoma_cmd message
+        #   (b) --holosoma-reference debug NPZ → dof_pos (achieved sim state)
+        #   (c) in-process WBT policy with fake robot_state (DEPRECATED —
+        #       kept as last-resort fallback; feeds the policy a synthetic
+        #       always-upright base state so output is unphysical. Use
+        #       only for sanity checks.)
+        if online_bag is not None:
+            idx = _nearest_stamp_idx(online_stamps, int(pico_stamps[t]))
+            q_wbt = online_q[idx, :29]
+            panel3_label = f"WBT /holosoma_cmd (online bag, +{(online_stamps[idx] - pico_stamps[t]) / 1e6:+.0f}ms)"
+        elif ref_dof_pos is not None:
+            # Prefer the real headless-sim trajectory from the reference
+            # debug NPZ — same data as panel 4 but this makes panel 3
+            # meaningful when the in-process fake-obs path was broken.
+            ref_idx = min(t, ref_dof_pos.shape[0] - 1)
+            q_wbt = ref_dof_pos[ref_idx]
+            panel3_label = f"WBT headless-sim dof_pos[{ref_idx}]"
+        else:
             payload = _build_tracking_payload(pico_pose)
             tracking.push(payload)
             try:
                 action = policy.rl_inference(robot_state)
                 q_wbt = np.asarray(action[0]) + policy.default_dof_angles
-                # Feed back: next frame's observations see the command
-                # we just issued, so obs evolve coherently frame-to-frame.
                 robot_state[0, 7 : 7 + num_dofs] = q_wbt
             except Exception as exc:
                 q_wbt = policy.default_dof_angles.copy()
@@ -799,47 +821,22 @@ def main() -> int:
                     print(f"  [panel3] frame {t}: policy inference failed: {exc!r}",
                           file=sys.stderr)
             panel3_label = "WBT policy output (offline, kinematic feedback)"
-        else:
-            idx = _nearest_stamp_idx(online_stamps, int(pico_stamps[t]))
-            # DOF >= 29 asserted at bag load time; slice guards the
-            # future-schema case where more DOFs (e.g. grippers) may
-            # follow the arm joints.
-            q_wbt = online_q[idx, :29]
-            panel3_label = f"WBT /holosoma_cmd (online bag, +{(online_stamps[idx] - pico_stamps[t]) / 1e6:+.0f}ms)"
 
         panel3 = _render_g1_pose(scene_wbt, q_wbt, panel3_label)
 
         panels = [panel1, panel2, panel3]
         if scene_ref is not None:
-            # Holosoma reference NPZ may be shorter than the pico clip
-            # if the user passed --max-frames smaller than the pico
-            # length. Saturate at the last available index.
-            ref_idx = min(t, ref_actions.shape[0] - 1)
-            # q_target = action * per_joint_policy_action_scale + default_dof
-            # When we have an in-process policy handle, pull its actual
-            # scale so the rendered panel matches ``scaled_policy_action
-            # + default_dof_angles`` as the debug-log's producer
-            # computed it. Without a policy handle we can only fall
-            # back to unit scale (correct for most wbt ONNX checkpoints
-            # but worth flagging in the label).
-            ref_scale = None
-            if policy is not None and hasattr(policy, "default_dof_angles"):
-                default_q = np.asarray(policy.default_dof_angles, dtype=np.float64)
-                pjs = getattr(policy, "per_joint_policy_action_scale", None)
-                if pjs is not None:
-                    ref_scale = np.asarray(pjs, dtype=np.float64).reshape(-1)
-            else:
-                default_q = scene_ref.default_q
-            if ref_scale is not None and ref_scale.shape[0] >= ref_actions.shape[1]:
-                q_ref = (ref_actions[ref_idx] * ref_scale[: ref_actions.shape[1]]
-                         + default_q[: ref_actions.shape[1]])
-                label_scale = "scaled"
-            else:
-                q_ref = ref_actions[ref_idx] + default_q[: ref_actions.shape[1]]
-                label_scale = "unit-scale"
+            # Render the holosoma-reference trajectory directly from the
+            # debug NPZ's ``dof_pos`` — this is the actual post-PD sim
+            # state at each frame, which is what the policy executed on
+            # the MuJoCo interface. (Rendering ``action * scale + default``
+            # produces the commanded set-point before PD smoothing, which
+            # is kinematically extreme for frames where the raw action is
+            # large and does not match what dense.mp4 showed.)
+            ref_idx = min(t, ref_dof_pos.shape[0] - 1)
+            q_ref = ref_dof_pos[ref_idx]
             panels.append(_render_g1_pose(
-                scene_ref, q_ref,
-                f"Holosoma ref ({label_scale}, action[{ref_idx}] + default)"))
+                scene_ref, q_ref, f"Holosoma ref (dof_pos[{ref_idx}])"))
 
         composite = np.concatenate(panels, axis=1)
         composite = _draw_frame_index(composite, t, poses.shape[0])
