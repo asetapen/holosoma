@@ -165,12 +165,73 @@ _IK_TARGETS: list[tuple[str, int, float, float]] = [
 _GROUND_FOOT_HEIGHT = 0.05
 
 
+def _strip_freejoint(xml_path: str) -> str | None:
+    """If the MJCF at ``xml_path`` has a ``<freejoint/>`` element, return
+    the XML with that element removed (so the model loads fixed-base).
+    Returns ``None`` if the file has no freejoint and can be loaded
+    directly via ``from_xml_path``.
+
+    Used by the retargeter to accept the shipped freejoint MJCFs (which
+    the policy's MuJoCo backend needs for its own sim) without inheriting
+    the freejoint DOF into the IK.
+    """
+    import os as _os
+    import re as _re
+
+    text = open(xml_path, "r", encoding="utf-8").read()
+    if "<freejoint" not in text:
+        return None
+    # Remove any line containing <freejoint .../> or <freejoint></freejoint>.
+    stripped = _re.sub(r"\s*<freejoint[^>]*/>\s*", "\n", text)
+    stripped = _re.sub(r"\s*<freejoint[^>]*>.*?</freejoint>\s*", "\n", stripped, flags=_re.DOTALL)
+    return stripped
+
+
+def _asset_dir_for(xml_path: str) -> dict:
+    """Return a single-entry asset dict mapping ``assets/<name>`` relative
+    paths (the way the shipped MJCFs reference mesh files) to their bytes,
+    so ``mujoco.MjModel.from_xml_string`` can find them without an
+    on-disk ``meshdir`` resolving relative to cwd.
+
+    Returning the full asset manifest on first load; mujoco caches the
+    parsed model after that.
+    """
+    import os as _os
+
+    base = _os.path.dirname(_os.path.abspath(xml_path))
+    assets: dict[str, bytes] = {}
+    for root, _dirs, files in _os.walk(base):
+        for fn in files:
+            if not fn.lower().endswith((".obj", ".stl", ".mtl", ".png", ".jpg")):
+                continue
+            p = _os.path.join(root, fn)
+            rel = _os.path.relpath(p, base)
+            with open(p, "rb") as f:
+                assets[rel] = f.read()
+    return assets
+
+
 class SMPLRetargeter:
     """Online retargeting from Pico body tracker to G1 29-DOF via mink differential IK."""
 
     def __init__(self, urdf_path: str, dt: float = 0.02, *, max_ik_iters: int = 20):
         # -- MuJoCo model (fixed base, 29 DOF) --
-        self._mj_model = mujoco.MjModel.from_xml_path(urdf_path)
+        # The retargeter's IK is designed for a fixed-base model — all
+        # ``_IK_TARGETS`` are expressed root-relative in
+        # ``_solve_ik_mink`` and the solver must not have freejoint DOF
+        # to absorb the tasks into. If the caller passed a MJCF with a
+        # ``<freejoint/>`` (the shipped ``g1_29dof.xml`` does, for use
+        # with the policy's MuJoCo backend), we strip it here so the
+        # retargeter sees only the articulated joints. Without this
+        # the IK bakes up to 7 DOF of body-rotation into the root,
+        # producing a non-identity root quat and joint angles that do
+        # not correspond to the SMPL pose.
+        model_xml = _strip_freejoint(urdf_path)
+        if model_xml is not None:
+            self._mj_model = mujoco.MjModel.from_xml_string(
+                model_xml, _asset_dir_for(urdf_path))
+        else:
+            self._mj_model = mujoco.MjModel.from_xml_path(urdf_path)
         self._mj_data = mujoco.MjData(self._mj_model)
 
         self._dt = dt
@@ -208,11 +269,9 @@ class SMPLRetargeter:
         self._height_ratio: float | None = None
 
         # -- State for velocity computation and warm-starting --
-        # Articulated joints only: the freejoint's 7 qpos entries are
-        # stripped in retarget() before we store joint state, so prev
-        # must match that shape (nq - 7 for freejoint-rooted models,
-        # nq otherwise).
-        self._num_joints = self._mj_model.nq - 7 if self._mj_model.nq > 7 else self._mj_model.nq
+        # After _strip_freejoint the model is always fixed-base, so
+        # ``nq`` directly counts the articulated joints we solve for.
+        self._num_joints = self._mj_model.nq
         self._prev_q_joints = np.zeros(self._num_joints)
         self._prev_root_pos = np.zeros(3)
         self._prev_root_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0])
@@ -368,13 +427,12 @@ class SMPLRetargeter:
 
         if _dbg:
             _t_pre_ik = _time.perf_counter()
-        # 6. Solve IK via mink. ``_solve_ik_mink`` returns the full qpos
-        # vector, which for a freejoint-rooted MuJoCo model is
-        # ``[x, y, z, qw, qx, qy, qz, *joint_angles]`` — the first 7 entries
-        # are the free base. The policy + robot SDK both expect only the
-        # 29 articulated joints, so slice them off here.
-        q_full = self._solve_ik_mink(positions, rotations)
-        q_joints = q_full[7:]  # drop freejoint qpos (xyz + wxyz)
+        # 6. Solve IK via mink. Because the retargeter model is always
+        # fixed-base (see ``_strip_freejoint`` in ``__init__``),
+        # ``self._config.q`` is already the N-DOF articulated joint
+        # vector with no freejoint prefix to slice off. The policy +
+        # robot SDK expect exactly these joints.
+        q_joints = self._solve_ik_mink(positions, rotations)
         if _dbg:
             _t_post_ik = _time.perf_counter()
 
@@ -393,12 +451,16 @@ class SMPLRetargeter:
         # Pinocchio-compatible _prev_q for visualizer (pos[3] + quat_xyzw[4] + joints[29])
         self._prev_q = np.concatenate([positions[0], root_body_quat_xyzw, q_joints])
 
-        # Public snapshot of the mink-solved root transform. Callers that
-        # need both root position and orientation (visualizers, FK over
-        # the freejoint-rooted MJCF) should read these rather than
-        # reaching into ``_config.q[:7]``.
-        self.last_root_pos = q_full[:3].copy()
-        self.last_root_quat_wxyz = q_full[3:7].copy()
+        # Public snapshot of the retargeter's chosen root transform —
+        # the SMPL pelvis (after coordinate-transform + scale + ground-
+        # anchor) in the robot's world frame. Downstream visualizers
+        # drive the freejoint-rooted render MJCF from these.
+        # Orientation is converted from scipy xyzw → mujoco wxyz.
+        self.last_root_pos = positions[0].copy()
+        self.last_root_quat_wxyz = np.array(
+            [root_body_quat_xyzw[3], root_body_quat_xyzw[0],
+             root_body_quat_xyzw[1], root_body_quat_xyzw[2]]
+        )
         if _dbg:
             _t_end = _time.perf_counter()
             logger.info(
