@@ -737,6 +737,8 @@ def main() -> int:
 
     frames = []
     print(f"Rendering {poses.shape[0]} frames ...", flush=True)
+    # One-shot vertical lift for panel 2 — see Panel-2 block below.
+    z_lift: float | None = None
     for t in range(poses.shape[0]):
         pico_pose = poses[t]
 
@@ -752,6 +754,17 @@ def main() -> int:
             q_ret, _, _ = retargeter.retarget(pico_pose)
             root_pos = retargeter.last_root_pos.copy()
             root_quat_wxyz = retargeter.last_root_quat_wxyz.copy()
+            # The retargeter runs ``_anchor_to_ground`` which drops the
+            # skeleton so feet sit at 5 cm — which puts the *pelvis*
+            # near the floor and makes the rendered robot look like
+            # it's squatting in a hole. Lift every frame by the same
+            # one-shot offset so frame 0's pelvis sits at the neutral
+            # standing height (retargeter._g1_leg, measured via FK).
+            # Relative-to-pelvis motion (squats, steps, leans) is
+            # preserved because the shift is constant.
+            if z_lift is None:
+                z_lift = float(retargeter._g1_leg) - float(root_pos[2])
+            root_pos[2] += z_lift
             # Planar-anchor: center the robot so all frames sit in the
             # viewport. Preserve height so squats/stands are visible.
             root_pos[0] = 0.0
