@@ -255,11 +255,28 @@ def _run_viewer(shm_name: str, offset: float, diff_report_hz: float):
     report_interval = 1.0 / max(diff_report_hz, 0.01)
     last_q_target = None
     last_dof_pos = None
+    # Diagnostics: count writer ticks seen between reports and track how
+    # much dof_pos is moving between reads. If dof_pos delta is ~0 the
+    # sim PD isn't advancing between policy calls (or the writer is
+    # reading a static source), which makes the diff field meaningless.
+    writes_seen = 0
+    prev_dof_pos = None
+    dof_pos_delta_accum = 0.0
+    # Joints to print absolute values for — picks from the typical top-5.
+    watch_names = [
+        "right_knee_joint", "left_knee_joint", "left_elbow_joint",
+        "waist_yaw_joint", "left_wrist_roll_joint",
+    ]
+    watch_idx = [dof_names.index(n) for n in watch_names if n in dof_names]
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
             reading = reader.read()
             if reading is not None:
                 q_target, dof_pos = reading
+                writes_seen += 1
+                if prev_dof_pos is not None:
+                    dof_pos_delta_accum += float(np.abs(dof_pos - prev_dof_pos).sum())
+                prev_dof_pos = dof_pos.copy()
                 last_q_target, last_dof_pos = q_target, dof_pos
                 for i, addr in enumerate(cmd_qpos):
                     data.qpos[addr] = q_target[i]
@@ -278,6 +295,24 @@ def _run_viewer(shm_name: str, offset: float, diff_report_hz: float):
                 top = np.argsort(diff)[-5:][::-1]
                 parts = [f"{dof_names[j]}={diff[j]:+.3f}" for j in top]
                 print(f"[diff] max={diff.max():.3f} rad top5: {' '.join(parts)}", flush=True)
+                # Absolute values on watched joints so we can tell which side
+                # the bias is on (command vs. achieved).
+                abs_parts = [
+                    f"{dof_names[j]} q_tgt={last_q_target[j]:+.3f} dof={last_dof_pos[j]:+.3f}"
+                    for j in watch_idx
+                ]
+                print(f"[abs]  {' | '.join(abs_parts)}", flush=True)
+                # Writer liveness + sim motion. writes_seen should bump by
+                # ~report_interval*policy_hz (e.g. 50 at 50Hz/1s). dof_pos
+                # sum-abs delta tells us whether sim state is actually
+                # changing between ticks.
+                print(
+                    f"[live] writes_since_last_report={writes_seen} "
+                    f"dof_pos_delta_sum={dof_pos_delta_accum:.4f} rad",
+                    flush=True,
+                )
+                writes_seen = 0
+                dof_pos_delta_accum = 0.0
                 last_report = now
 
             time.sleep(0.002)
