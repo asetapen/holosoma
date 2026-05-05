@@ -316,11 +316,15 @@ def _render_pico_panel(pose_xyz, fig_canvas, ax):
 
     ax.cla()
 
-    # pico frame is Y-up; rotate to Z-up so it matches the MuJoCo panels.
-    # (x, y, z) -> (x, -z, y) — same transform the retargeter uses.
+    # pico frame is Y-up; rotate to Z-up, then apply a 90° CCW yaw
+    # (viewed from above) so the skeleton faces the same direction as
+    # the G1 in the MuJoCo panels.
+    # Z-up:  (x, y, z) -> (x, -z, y)
+    # +90 CCW yaw around Z:  (x, y, z) -> (-y, x, z)
+    # Composed: (x, y, z) -> (z, x, y)
     rotated = np.empty_like(pose_xyz)
-    rotated[:, 0] = pose_xyz[:, 0]
-    rotated[:, 1] = -pose_xyz[:, 2]
+    rotated[:, 0] = pose_xyz[:, 2]
+    rotated[:, 1] = pose_xyz[:, 0]
     rotated[:, 2] = pose_xyz[:, 1]
 
     # Pin the pelvis at (0, 0) horizontally so the figure doesn't drift off
