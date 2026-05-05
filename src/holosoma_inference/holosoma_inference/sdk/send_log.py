@@ -81,7 +81,8 @@ class SendLogger:
         every = _env_int("HOLOSOMA_SEND_LOG_EVERY", 100)
         if every <= 0 or self._counter % every != 0:
             return
-        q_slice = list(q_target) if _env_bool("HOLOSOMA_SEND_LOG_FULL", False) else list(q_target[:6])
+        full = _env_bool("HOLOSOMA_SEND_LOG_FULL", False)
+        q_slice = list(q_target) if full else list(q_target[:6])
         record: dict[str, Any] = {
             "ts": time.time(),
             "pid": os.getpid(),
@@ -93,9 +94,14 @@ class SendLogger:
         if _env_bool("HOLOSOMA_SEND_LOG_INCLUDE_STATE", False) and unitree is not None:
             try:
                 state = unitree.read_low_state()
+                # Match q_target's truncation: FULL=1 captures all 29 motors,
+                # FULL=0 stays at the first 6 for leg-focused debug. imu_quat
+                # is always 4 floats.
+                q_list = list(state.motor.q) if full else list(state.motor.q)[:6]
+                dq_list = list(state.motor.dq) if full else list(state.motor.dq)[:6]
                 record["state"] = {
-                    "q": [float(v) for v in list(state.motor.q)[:6]],
-                    "dq": [float(v) for v in list(state.motor.dq)[:6]],
+                    "q": [float(v) for v in q_list],
+                    "dq": [float(v) for v in dq_list],
                     "imu_quat": [float(v) for v in list(state.imu.quat)],
                 }
             except Exception as exc:  # noqa: BLE001
