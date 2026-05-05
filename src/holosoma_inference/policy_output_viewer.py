@@ -219,6 +219,17 @@ class _PolicyOutputShmReader:
             return True
         try:
             self._shm = self._shared_memory.SharedMemory(name=self._shm_name, create=False)
+            # We're only attaching to a segment the wbt-teleop driver owns;
+            # Python's resource_tracker registers it here anyway and emits a
+            # "leaked shared_memory objects" warning at reader exit because
+            # the writer is still attached. Unregister to keep the reader
+            # from trying to clean up what it doesn't own. Best-effort: API
+            # is private and varies across Python versions.
+            try:
+                from multiprocessing import resource_tracker
+                resource_tracker.unregister(self._shm._name, "shared_memory")
+            except Exception:
+                pass
             off = self._HEADER_SIZE
             self._q_target = np.ndarray(
                 (self._num_dofs,), dtype=np.float64,
