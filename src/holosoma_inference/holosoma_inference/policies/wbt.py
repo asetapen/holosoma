@@ -412,7 +412,17 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 )
             retargeted = self._retarget_payload_to_motion_command(external)
             if retargeted is not None:
-                self.motion_command_t = retargeted
+                retargeted_motion_command, retargeted_ref_quat_xyzw = retargeted
+                self.motion_command_t = retargeted_motion_command
+                # Also substitute the reference orientation. Without this,
+                # motion_ref_ori_b in the obs stays anchored at the ONNX
+                # clip's baseline pose while joint targets come from live
+                # teleop, which caused the on-robot T-pose under-reach on
+                # 2026-05-05 (walker review finding #5). None means the
+                # retargeter returned an invalid root quat; hold the last
+                # value rather than feed NaN into the obs.
+                if retargeted_ref_quat_xyzw is not None:
+                    self.ref_quat_xyzw_t = retargeted_ref_quat_xyzw
         if _dbg:
             _ts.append(("retarget", _time.perf_counter()))
 
@@ -465,13 +475,21 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         return self.scaled_policy_action
 
-    def _retarget_payload_to_motion_command(self, payload) -> np.ndarray | None:
-        """Translate a ``TrackingPayload`` into ``motion_command_t`` via SMPLRetargeter.
+    def _retarget_payload_to_motion_command(
+        self, payload
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Translate a ``TrackingPayload`` into (motion_command_t, ref_quat_xyzw_t).
 
-        Returns a ``(1, 58)`` float32 array (29 DOF joint_pos followed by
-        29 DOF joint_vel) on success, or ``None`` when retargeting is not
-        usable — the caller falls through to the ONNX-clip path in that
-        case.
+        Returns a tuple of two arrays on success, or ``None`` when retargeting
+        is not usable — the caller falls through to the ONNX-clip path in
+        that case.
+
+        Return tuple:
+          * ``motion_command_t``: ``(1, 58)`` float32 (29 joint_pos then 29 joint_vel).
+          * ``ref_quat_xyzw_t``: ``(1, 4)`` float32 xyzw root orientation from
+            the retargeter's IK-solved freejoint. Feeds ``motion_ref_ori_b``
+            in ``get_current_obs_buffer_dict`` so the policy's orientation cue
+            tracks live teleop instead of the frozen ONNX-clip baseline.
 
         Failure modes handled here (all fall through, none raise):
           * ``robot.urdf_path`` is unset → cannot construct the retargeter.
@@ -528,7 +546,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             return None
 
         try:
-            q_joints, dq_joints, _root_orn_wxyz = self._retargeter.retarget(transforms)
+            q_joints, dq_joints, root_orn_wxyz = self._retargeter.retarget(transforms)
         except Exception as exc:  # noqa: BLE001
             if not self._retargeter_runtime_warned:
                 logger.warning(
@@ -550,7 +568,33 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self._retargeter_runtime_warned = True
             return None
 
-        return np.concatenate([q_joints, dq_joints]).reshape(1, -1)
+        motion_command = np.concatenate([q_joints, dq_joints]).reshape(1, -1)
+
+        # Convert the retargeter's wxyz root quaternion into xyzw and shape
+        # it to match how get_current_obs_buffer_dict consumes
+        # ref_quat_xyzw_t: (1, 4) so self.ref_quat_xyzw_t[0] indexes cleanly
+        # through xyzw_to_wxyz + _remove_yaw_offset. If the retargeter hands
+        # back something non-finite (rare — only seen after a failed IK
+        # solve that nonetheless returned), fall through; motion_command_t
+        # still gets the joint targets but ref_quat_xyzw_t stays at its
+        # last valid value rather than propagating garbage into the obs.
+        root_orn_wxyz = np.asarray(root_orn_wxyz, dtype=np.float32).reshape(-1)
+        if root_orn_wxyz.size != 4 or not np.all(np.isfinite(root_orn_wxyz)):
+            if not self._retargeter_runtime_warned:
+                logger.warning(
+                    f"WBT tracking_source: retargeter root_orn_wxyz invalid "
+                    f"(size={root_orn_wxyz.size}); keeping previous ref_quat_xyzw_t. "
+                    "Further failures suppressed."
+                )
+                self._retargeter_runtime_warned = True
+            return motion_command, None
+
+        # wxyz -> xyzw: (w, x, y, z) -> (x, y, z, w).
+        ref_quat_xyzw = np.array(
+            [root_orn_wxyz[1], root_orn_wxyz[2], root_orn_wxyz[3], root_orn_wxyz[0]],
+            dtype=np.float32,
+        ).reshape(1, 4)
+        return motion_command, ref_quat_xyzw
 
     def _configure_action_scales(self) -> None:
         """Configure action scales, prioritising ONNX metadata over config fallbacks.
