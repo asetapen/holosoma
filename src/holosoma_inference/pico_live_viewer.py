@@ -298,6 +298,11 @@ def _run_viewer(source_iter, show: str, real_time: bool):
             data.qpos[0:3] = [0.0, 0.0, 0.793]
             data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
 
+    # Side-by-side offset: when a G1 is in the scene, shove the skeleton
+    # left so the two figures don't overlap. Matches the policy_output_viewer
+    # convention (left = secondary view, right = primary robot).
+    skeleton_offset_x = -1.0 if show in ("retarget", "wbt") else 0.0
+
     print(f"Starting viewer (show={show}, real_time={real_time})", flush=True)
     last_stamp_ns: int | None = None
     with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -312,6 +317,12 @@ def _run_viewer(source_iter, show: str, real_time: bool):
             # Pin pelvis planar; keep height.
             xyz[:, 0] -= xyz[0, 0]
             xyz[:, 1] -= xyz[0, 1]
+            # Anchor feet on the ground plane. Some pico clips zero their
+            # frame at the head, so the raw pelvis Z can be below z=0 and
+            # the skeleton renders beneath the floor. Shift by the lowest
+            # joint so the feet sit at z=0.
+            xyz[:, 2] -= xyz[:, 2].min()
+            xyz[:, 0] += skeleton_offset_x
             for i, mid in enumerate(mocap_ids):
                 data.mocap_pos[mid] = xyz[i]
 
@@ -320,10 +331,13 @@ def _run_viewer(source_iter, show: str, real_time: bool):
                     q_joints, _, _ = retargeter.retarget(pose)
                     for k, idx in enumerate(g1_dof_qpos_idx):
                         data.qpos[idx] = float(q_joints[k])
-                    mujoco.mj_forward(model, data)
                 except Exception as exc:
                     print(f"  retarget failed: {exc!r}", file=sys.stderr)
 
+            # Unconditional forward kinematics so mocap_pos writes propagate
+            # to xpos. Without this, skeleton-only mode shows all 24 spheres
+            # stacked at origin because data.xpos never updates.
+            mujoco.mj_forward(model, data)
             viewer.sync()
 
             # Pace to the incoming rate when replaying an MCAP.
@@ -332,6 +346,14 @@ def _run_viewer(source_iter, show: str, real_time: bool):
                 if 0 < dt_ns < 1_000_000_000:  # cap sleep at 1s
                     time.sleep(dt_ns / 1e9)
             last_stamp_ns = stamp_ns
+
+        # MCAP exhausted. Keep the viewer window up so the user can inspect
+        # the final frame; exit cleanly when they close it. Tearing down
+        # launch_passive from the main thread immediately after the last
+        # sync() races glfw's TLS cleanup and trips a posix_thread assert.
+        print("Source exhausted. Close the viewer window to exit.", flush=True)
+        while viewer.is_running():
+            time.sleep(0.05)
 
 
 def main() -> int:
@@ -354,8 +376,19 @@ def main() -> int:
     args = p.parse_args()
 
     if args.mcap is not None:
+        # Resolve relative --mcap paths against the user's invoke directory.
+        # Under `bazel run` the CWD is the runfiles sandbox, so a relative
+        # path like "holosoma_extensions/test_data/foo.mcap" won't resolve
+        # there; BUILD_WORKING_DIRECTORY holds the pre-bazel CWD.
+        mcap_path = args.mcap
+        if not mcap_path.is_absolute():
+            base = os.environ.get("BUILD_WORKING_DIRECTORY") or os.getcwd()
+            mcap_path = (Path(base) / mcap_path).resolve()
+        if not mcap_path.exists():
+            print(f"MCAP not found: {mcap_path}", file=sys.stderr)
+            return 2
         max_frames = args.max_frames if args.max_frames > 0 else None
-        source = _mcap_source(args.mcap, max_frames)
+        source = _mcap_source(mcap_path, max_frames)
         real_time = not args.no_real_time
     else:
         source = _live_source(args.topic)
