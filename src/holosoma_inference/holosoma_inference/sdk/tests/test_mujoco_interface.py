@@ -153,3 +153,60 @@ def test_joystick_stubs_return_empty(iface):
     assert msg is not None
     assert msg.keys == 0
     assert iface.get_joystick_key() is None
+
+
+def test_init_pelvis_freejoint_placed_feet_on_floor(iface):
+    # Regression: earlier init left qpos[0:7] at MuJoCo's zero default
+    # (pos=0, quat=0,0,0,0), putting legs through the floor and producing
+    # an invalid base_quat the policy then amplified into runaway commands.
+    # Fix: write identity quat and measure pelvis height so both feet sit
+    # on z=0. This test asserts the init post-conditions.
+    pelvis_z = float(iface.data.qpos[2])
+    assert 0.4 < pelvis_z < 1.2, f"pelvis z={pelvis_z} outside standing range"
+    quat = iface.data.qpos[3:7].copy()
+    assert abs(np.linalg.norm(quat) - 1.0) < 1e-6, f"non-unit init quat {quat}"
+    # At least one foot within 2 cm of the floor (the FK-computed offset
+    # nails the lower foot; the other can be up to 2 cm higher on the
+    # default pose since left/right legs aren't perfectly symmetric once
+    # the shipped default_dof_angles are applied).
+    foot_zs = []
+    for foot_name in ("left_ankle_roll_link", "right_ankle_roll_link"):
+        bid = iface._mujoco.mj_name2id(
+            iface.model, iface._mujoco.mjtObj.mjOBJ_BODY, foot_name
+        )
+        assert bid >= 0, f"missing body {foot_name} in MJCF"
+        foot_zs.append(float(iface.data.xpos[bid, 2]))
+    assert min(foot_zs) < 0.02, f"neither foot near floor; foot_zs={foot_zs}"
+
+
+def test_init_gravity_hold_stays_upright(iface):
+    # With gravity on and zero kp/kd (no control), a correctly-initialized
+    # robot should not fall catastrophically within a short window. If the
+    # pelvis/feet are mis-placed the robot accelerates through the floor
+    # and joints blow past their range. Asserts a bounded fall.
+    # Low gains so there's no PD driving the sim; only gravity + contacts.
+    kp = np.zeros(29)
+    kd = np.zeros(29)
+    target = np.array(G1_CONFIG.default_dof_angles, dtype=np.float64)
+    pelvis_z_start = float(iface.data.qpos[2])
+    for _ in range(100):
+        iface.send_low_command(
+            cmd_q=target, cmd_dq=np.zeros(29), cmd_tau=np.zeros(29),
+            kp_override=kp, kd_override=kd,
+        )
+        iface.step(1)
+    pelvis_z_end = float(iface.data.qpos[2])
+    # Accept some settling (a few cm) but reject "robot through floor".
+    assert pelvis_z_end > pelvis_z_start - 0.15, (
+        f"pelvis fell from {pelvis_z_start:.3f} to {pelvis_z_end:.3f} — "
+        "initialization may be misplaced"
+    )
+    # And no joint has blown through MJCF range
+    joint_pos = iface.get_low_state()[0, 7:7 + 29]
+    lo = iface._joint_limits_lo
+    hi = iface._joint_limits_hi
+    violations = np.where((joint_pos < lo - 0.1) | (joint_pos > hi + 0.1))[0]
+    assert len(violations) == 0, (
+        f"joints blew past range: indices={violations.tolist()}, "
+        f"values={joint_pos[violations].tolist()}"
+    )

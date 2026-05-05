@@ -147,6 +147,26 @@ class MujocoInterface(BaseInterface):
         defaults = np.asarray(robot_config.default_dof_angles, dtype=np.float64)
         for j_id in range(robot_config.num_joints):
             self.data.qpos[self._dof_qpos_idx[j_id]] = defaults[j_id]
+        # Initialize the pelvis freejoint. MuJoCo's qpos default for an
+        # unwritten freejoint is (pos=0, quat=0,0,0,0) which is both
+        # underground and a zero quaternion. Set identity-quat, then FK
+        # with a throwaway tall pelvis to measure the foot-z when the
+        # legs are in their default bent-knee pose, and drop the pelvis
+        # by that offset so the feet rest on the floor at t=0.
+        self.data.qpos[0:3] = [0.0, 0.0, 5.0]
+        self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        mujoco.mj_forward(self.model, self.data)
+        foot_z_values = []
+        for foot_name in ("left_ankle_roll_link", "right_ankle_roll_link"):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, foot_name)
+            if bid >= 0:
+                foot_z_values.append(float(self.data.xpos[bid, 2]))
+        if foot_z_values:
+            pelvis_z = 5.0 - min(foot_z_values)
+        else:
+            pelvis_z = 0.793
+        self.data.qpos[2] = pelvis_z
+        self.data.qvel[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
 
         self._dampener = Dampener(joint_limits_lo=lo, joint_limits_hi=hi)
