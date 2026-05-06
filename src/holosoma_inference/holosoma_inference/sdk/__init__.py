@@ -59,10 +59,7 @@ def create_interface(robot_config, domain_id=0, interface_str=None, use_joystick
         if builtin is not None:
             _registry[sdk_type] = builtin
         else:
-            raise ValueError(
-                f"Unknown sdk_type: {sdk_type}. Available (entry_points): "
-                f"{sorted(_entry_points.keys())}"
-            )
+            raise ValueError(f"Unknown sdk_type: {sdk_type}. Available (entry_points): {sorted(_entry_points.keys())}")
 
     # Lazy load: only load the entry point when actually needed
     if sdk_type not in _registry:

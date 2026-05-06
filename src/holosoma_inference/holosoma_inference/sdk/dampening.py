@@ -20,9 +20,10 @@ HOLOSOMA_Q_LIMIT_SCALE   float, default unset (= off).  Scale factor in
                          [0, 1] against the robot's per-joint hard limits
                          when clipping q_target.  1.0 = clip to hard limits,
                          0.5 = clip to the midpoint, etc.
-HOLOSOMA_BLEND_ALPHA     float, default 1.0.  α in q_send = α·q_tgt +
-                         (1-α)·q_current.  α=1 is pass-through; α=0 freezes
-                         output at current measured q.  Requires the caller
+HOLOSOMA_BLEND_ALPHA     float, default 1.0.  alpha in
+                         q_send = alpha*q_tgt + (1-alpha)*q_current.
+                         alpha=1 is pass-through; alpha=0 freezes output
+                         at the current measured q.  Requires the caller
                          to pass dof_pos_latest.
 
 All knobs are read from the environment at every ``apply()`` call so they can
@@ -32,13 +33,13 @@ be toggled at runtime without restarting the driver.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional, Sequence
 
 import numpy as np
 
 
-def _env_float(name: str, default: Optional[float]) -> Optional[float]:
+def _env_float(name: str, default: float | None) -> float | None:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
@@ -52,12 +53,12 @@ def _env_float(name: str, default: Optional[float]) -> Optional[float]:
 class DampeningKnobs:
     kp_level: float
     kd_level: float
-    q_slew_per_tick: Optional[float]
-    q_limit_scale: Optional[float]
+    q_slew_per_tick: float | None
+    q_limit_scale: float | None
     blend_alpha: float
 
     @classmethod
-    def from_env(cls) -> "DampeningKnobs":
+    def from_env(cls) -> DampeningKnobs:
         kp = _env_float("HOLOSOMA_KP_LEVEL", 1.0)
         kd = _env_float("HOLOSOMA_KD_LEVEL", 1.0)
         blend = _env_float("HOLOSOMA_BLEND_ALPHA", 1.0)
@@ -83,16 +84,12 @@ class Dampener:
 
     def __init__(
         self,
-        joint_limits_lo: Optional[Sequence[float]] = None,
-        joint_limits_hi: Optional[Sequence[float]] = None,
+        joint_limits_lo: Sequence[float] | None = None,
+        joint_limits_hi: Sequence[float] | None = None,
     ):
-        self._prev_q_out: Optional[np.ndarray] = None
-        self._joint_limits_lo = (
-            np.asarray(joint_limits_lo, dtype=np.float64) if joint_limits_lo is not None else None
-        )
-        self._joint_limits_hi = (
-            np.asarray(joint_limits_hi, dtype=np.float64) if joint_limits_hi is not None else None
-        )
+        self._prev_q_out: np.ndarray | None = None
+        self._joint_limits_lo = np.asarray(joint_limits_lo, dtype=np.float64) if joint_limits_lo is not None else None
+        self._joint_limits_hi = np.asarray(joint_limits_hi, dtype=np.float64) if joint_limits_hi is not None else None
 
     def set_joint_limits(self, lo: Sequence[float], hi: Sequence[float]) -> None:
         self._joint_limits_lo = np.asarray(lo, dtype=np.float64)
@@ -109,8 +106,8 @@ class Dampener:
         cmd_tau: np.ndarray,
         kp: np.ndarray,
         kd: np.ndarray,
-        dof_pos_latest: Optional[np.ndarray],
-        knobs: Optional[DampeningKnobs] = None,
+        dof_pos_latest: np.ndarray | None,
+        knobs: DampeningKnobs | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return dampened (q, dq, tau, kp, kd)."""
         if knobs is None:
@@ -134,11 +131,7 @@ class Dampener:
         # turns a live target into NaN. In practice every G1 joint has a
         # range, but guard so a future MJCF without one doesn't trip a
         # silent failure.
-        if (
-            knobs.q_limit_scale is not None
-            and self._joint_limits_lo is not None
-            and self._joint_limits_hi is not None
-        ):
+        if knobs.q_limit_scale is not None and self._joint_limits_lo is not None and self._joint_limits_hi is not None:
             scale = float(knobs.q_limit_scale)
             limited = np.isfinite(self._joint_limits_lo) & np.isfinite(self._joint_limits_hi)
             if limited.any():

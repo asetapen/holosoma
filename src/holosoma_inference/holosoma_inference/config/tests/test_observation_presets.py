@@ -2,9 +2,9 @@
 
 Guards against silent drift that breaks a deployed ONNX checkpoint:
 
-* ``wbt`` stays at 154 × history_length 1 (the stock six-term preset).
-* ``wbt-dense`` stays at 157 × history_length 4 → 628-dim obs, which
-  matches Jinkun's g1-wbt dense training config. Regressions here manifest
+* ``wbt`` stays at 154 x history_length 1 (the stock six-term preset).
+* ``wbt-dense`` stays at 157 x history_length 4 -> 628-dim obs, which
+  matches the g1-wbt dense training config. Regressions here manifest
   at runtime as
   ``InvalidArgument: Got invalid dimensions for input: obs``.
 """

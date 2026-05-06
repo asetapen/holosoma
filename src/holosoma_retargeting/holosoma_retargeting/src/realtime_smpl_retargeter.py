@@ -175,16 +175,15 @@ def _strip_freejoint(xml_path: str) -> str | None:
     the policy's MuJoCo backend needs for its own sim) without inheriting
     the freejoint DOF into the IK.
     """
-    import os as _os
     import re as _re
+    from pathlib import Path as _Path
 
-    text = open(xml_path, "r", encoding="utf-8").read()
+    text = _Path(xml_path).read_text(encoding="utf-8")
     if "<freejoint" not in text:
         return None
     # Remove any line containing <freejoint .../> or <freejoint></freejoint>.
     stripped = _re.sub(r"\s*<freejoint[^>]*/>\s*", "\n", text)
-    stripped = _re.sub(r"\s*<freejoint[^>]*>.*?</freejoint>\s*", "\n", stripped, flags=_re.DOTALL)
-    return stripped
+    return _re.sub(r"\s*<freejoint[^>]*>.*?</freejoint>\s*", "\n", stripped, flags=_re.DOTALL)
 
 
 _ASSET_CACHE: dict[str, dict[str, bytes]] = {}
@@ -240,8 +239,7 @@ class SMPLRetargeter:
         # not correspond to the SMPL pose.
         model_xml = _strip_freejoint(urdf_path)
         if model_xml is not None:
-            self._mj_model = mujoco.MjModel.from_xml_string(
-                model_xml, _asset_dir_for(urdf_path))
+            self._mj_model = mujoco.MjModel.from_xml_string(model_xml, _asset_dir_for(urdf_path))
         else:
             self._mj_model = mujoco.MjModel.from_xml_path(urdf_path)
         self._mj_data = mujoco.MjData(self._mj_model)
@@ -382,8 +380,12 @@ class SMPLRetargeter:
         _IK_PSEUDO_DT = 0.1
         for _ in range(self._max_ik_iters):
             vel = mink.solve_ik(
-                self._config, tasks, dt=_IK_PSEUDO_DT,
-                solver="daqp", damping=1e-4, limits=limits,
+                self._config,
+                tasks,
+                dt=_IK_PSEUDO_DT,
+                solver="daqp",
+                damping=1e-4,
+                limits=limits,
             )
             self._config.integrate_inplace(vel, _IK_PSEUDO_DT)
             if np.linalg.norm(vel) < tol:
@@ -483,8 +485,7 @@ class SMPLRetargeter:
         # Orientation is converted from scipy xyzw → mujoco wxyz.
         self.last_root_pos = positions[0].copy()
         self.last_root_quat_wxyz = np.array(
-            [root_body_quat_xyzw[3], root_body_quat_xyzw[0],
-             root_body_quat_xyzw[1], root_body_quat_xyzw[2]]
+            [root_body_quat_xyzw[3], root_body_quat_xyzw[0], root_body_quat_xyzw[1], root_body_quat_xyzw[2]]
         )
         if _dbg:
             _t_end = _time.perf_counter()

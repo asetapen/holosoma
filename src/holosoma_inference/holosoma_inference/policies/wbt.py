@@ -79,12 +79,12 @@ class _InlinePolicyOutputShmWriter:
     def close(self) -> None:
         try:
             self._shm.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("SHM close failed: {}", exc)
         try:
             self._shm.unlink()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("SHM unlink failed: {}", exc)
 
 
 class WholeBodyTrackingPolicy(BasePolicy):
@@ -211,9 +211,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
     def setup_policy(self, model_path):
         from holosoma_inference.policies.base import _build_ort_session_options
 
-        self.onnx_policy_session = onnxruntime.InferenceSession(
-            model_path, sess_options=_build_ort_session_options()
-        )
+        self.onnx_policy_session = onnxruntime.InferenceSession(model_path, sess_options=_build_ort_session_options())
         self.onnx_input_names = [inp.name for inp in self.onnx_policy_session.get_inputs()]
         self.onnx_output_names = [out.name for out in self.onnx_policy_session.get_outputs()]
 
@@ -279,8 +277,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if w is not None:
             try:
                 w.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("policy-output SHM close failed: {}", exc)
             self._policy_shm_writer = None
 
     def _capture_policy_state(self):
@@ -379,9 +377,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             current_obs_buffer_dict["projected_gravity"] = robot_state_data[:, expected_len : expected_len + 3]
         else:
             v = np.array([[0, 0, -1]])
-            current_obs_buffer_dict["projected_gravity"] = quat_rotate_inverse(
-                current_obs_buffer_dict["base_quat"], v
-            )
+            current_obs_buffer_dict["projected_gravity"] = quat_rotate_inverse(current_obs_buffer_dict["base_quat"], v)
 
         return current_obs_buffer_dict
 
@@ -486,7 +482,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             for i in range(1, len(_ts)):
                 dt_ms = (_ts[i][1] - _ts[i - 1][1]) * 1000.0
                 parts.append(f"{_ts[i][0]}={dt_ms:.2f}ms")
-            logger.info(f"[inference_timing] " + " ".join(parts))
+            logger.info("[inference_timing] " + " ".join(parts))
 
         return self.scaled_policy_action
 
@@ -510,19 +506,14 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self._retargeter_runtime_warned = True
             self._retargeter_runtime_last_warn_count = 1
             return
-        delta = (
-            self._retargeter_runtime_err_count - self._retargeter_runtime_last_warn_count
-        )
+        delta = self._retargeter_runtime_err_count - self._retargeter_runtime_last_warn_count
         if delta >= self._retargeter_runtime_rewarn_every:
             logger.warning(
-                "WBT tracking_source: retargeter still failing. "
-                "{} total fallthroughs so far (last reason: {}).",
+                "WBT tracking_source: retargeter still failing. {} total fallthroughs so far (last reason: {}).",
                 self._retargeter_runtime_err_count,
                 reason,
             )
-            self._retargeter_runtime_last_warn_count = (
-                self._retargeter_runtime_err_count
-            )
+            self._retargeter_runtime_last_warn_count = self._retargeter_runtime_err_count
 
     def _reset_retargeter_runtime_state(self) -> None:
         """Clear the one-shot WARN latch + error counter.
@@ -535,9 +526,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._retargeter_runtime_err_count = 0
         self._retargeter_runtime_last_warn_count = 0
 
-    def _retarget_payload_to_motion_command(
-        self, payload
-    ) -> tuple[np.ndarray, np.ndarray] | None:
+    def _retarget_payload_to_motion_command(self, payload) -> tuple[np.ndarray, np.ndarray] | None:
         """Translate a ``TrackingPayload`` into (motion_command_t, ref_quat_xyzw_t).
 
         Returns a tuple of two arrays on success, or ``None`` when retargeting
@@ -596,7 +585,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
                 ik_iters = int(_os.environ.get("HOLOSOMA_RETARGETER_IK_ITERS", "4") or 4)
                 self._retargeter = SMPLRetargeter(urdf_path=urdf_path, dt=dt, max_ik_iters=ik_iters)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self._retargeter_init_failed = True
                 logger.warning(
                     "WBT tracking_source: failed to construct SMPLRetargeter "
@@ -618,7 +607,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         try:
             q_joints, dq_joints, root_orn_wxyz = self._retargeter.retarget(transforms)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._retargeter_warn(f"SMPLRetargeter.retarget raised {exc!r}")
             return None
 
@@ -626,8 +615,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         dq_joints = np.asarray(dq_joints, dtype=np.float32).reshape(-1)
         if q_joints.size != self.num_dofs or dq_joints.size != self.num_dofs:
             self._retargeter_warn(
-                f"retargeter returned unexpected dim "
-                f"(q={q_joints.size}, dq={dq_joints.size}, expected={self.num_dofs})"
+                f"retargeter returned unexpected dim (q={q_joints.size}, dq={dq_joints.size}, expected={self.num_dofs})"
             )
             return None
 
@@ -644,8 +632,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         root_orn_wxyz = np.asarray(root_orn_wxyz, dtype=np.float32).reshape(-1)
         if root_orn_wxyz.size != 4 or not np.all(np.isfinite(root_orn_wxyz)):
             self._retargeter_warn(
-                f"retargeter root_orn_wxyz invalid (size={root_orn_wxyz.size}); "
-                "keeping previous ref_quat_xyzw_t"
+                f"retargeter root_orn_wxyz invalid (size={root_orn_wxyz.size}); keeping previous ref_quat_xyzw_t"
             )
             return motion_command, None
 

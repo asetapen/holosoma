@@ -143,7 +143,7 @@ wbt = ObservationConfig(
 )
 
 # Dense-tracker WBT preset — matches the actor-obs composition produced by
-# the g1-wbt dense training config (157-dim base × history 4 = 628 into the
+# the g1-wbt dense training config (157-dim base x history 4 = 628 into the
 # ONNX `obs` input).
 #
 # Differences vs stock ``wbt``: adds ``projected_gravity`` term (position 3,

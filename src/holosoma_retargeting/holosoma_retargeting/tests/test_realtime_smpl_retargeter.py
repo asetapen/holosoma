@@ -32,13 +32,7 @@ from holosoma_retargeting.src.realtime_smpl_retargeter import (  # noqa: E402
     SMPLRetargeter,
 )
 
-
-_MODEL_PATH = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "models"
-    / "g1"
-    / "g1_29dof.xml"
-)
+_MODEL_PATH = pathlib.Path(__file__).resolve().parents[1] / "models" / "g1" / "g1_29dof.xml"
 
 
 def _make_smpl_frame() -> np.ndarray:
@@ -63,8 +57,7 @@ class TestRetargetShape:
     def test_q_joints_is_29_dof(self, retargeter: SMPLRetargeter) -> None:
         q, _dq, _root = retargeter.retarget(_make_smpl_frame())
         assert q.shape == (29,), (
-            f"retarget() must return 29 joint angles "
-            f"(stripping the freejoint's 7 qpos entries). Got shape {q.shape}."
+            f"retarget() must return 29 joint angles (stripping the freejoint's 7 qpos entries). Got shape {q.shape}."
         )
 
     def test_dq_joints_is_29_dof(self, retargeter: SMPLRetargeter) -> None:
@@ -82,9 +75,7 @@ class TestRetargetShape:
         _q, dq, _root = retargeter.retarget(_make_smpl_frame())
         np.testing.assert_allclose(dq, np.zeros(29), atol=1e-9)
 
-    def test_consecutive_calls_produce_finite_output(
-        self, retargeter: SMPLRetargeter
-    ) -> None:
+    def test_consecutive_calls_produce_finite_output(self, retargeter: SMPLRetargeter) -> None:
         retargeter.reset()
         q1, _, _ = retargeter.retarget(_make_smpl_frame())
         q2, dq2, _ = retargeter.retarget(_make_smpl_frame())
@@ -96,9 +87,7 @@ class TestRetargetShape:
 class TestRetargeterStateShapes:
     """The internal state buffers must also use the articulated-joint count."""
 
-    def test_prev_q_joints_matches_articulated_count(
-        self, retargeter: SMPLRetargeter
-    ) -> None:
+    def test_prev_q_joints_matches_articulated_count(self, retargeter: SMPLRetargeter) -> None:
         assert retargeter._prev_q_joints.shape == (retargeter._num_joints,)
         assert retargeter._num_joints == 29
 

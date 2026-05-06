@@ -417,9 +417,7 @@ class BasePolicy:
 
     def setup_policy(self, model_path):
         """Setup ONNX policy model and extract metadata."""
-        self.onnx_policy_session = onnxruntime.InferenceSession(
-            model_path, sess_options=_build_ort_session_options()
-        )
+        self.onnx_policy_session = onnxruntime.InferenceSession(model_path, sess_options=_build_ort_session_options())
         input_names = [inp.name for inp in self.onnx_policy_session.get_inputs()]
         output_names = [out.name for out in self.onnx_policy_session.get_outputs()]
 
@@ -826,10 +824,10 @@ class BasePolicy:
         if d is not None:
             try:
                 d.reset()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:
                 # Best-effort. Dampener is optional; interface may be a
                 # test double that doesn't implement it.
-                pass
+                self.logger.debug("Dampener.reset() failed: %r", exc)
 
     def _handle_start_policy(self):
         """Handle start policy action."""

@@ -9,11 +9,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import mujoco
 import numpy as np
 import torch
 from loguru import logger
-
-import mujoco
 
 from .base import IMujocoBackend
 

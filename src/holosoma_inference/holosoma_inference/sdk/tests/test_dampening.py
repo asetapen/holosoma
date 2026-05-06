@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import pytest
 
-from holosoma_inference.sdk.dampening import DampeningKnobs, Dampener
+from holosoma_inference.sdk.dampening import Dampener, DampeningKnobs
 
 
 @pytest.fixture(autouse=True)
@@ -20,16 +18,15 @@ def _clear_env(monkeypatch):
         "HOLOSOMA_BLEND_ALPHA",
     ):
         monkeypatch.delenv(name, raising=False)
-    yield
 
 
 def _make_inputs(n=29):
     return (
-        np.ones(n) * 2.0,           # cmd_q
-        np.zeros(n),                # cmd_dq
-        np.zeros(n),                # cmd_tau
-        np.ones(n) * 100.0,         # kp
-        np.ones(n) * 5.0,           # kd
+        np.ones(n) * 2.0,  # cmd_q
+        np.zeros(n),  # cmd_dq
+        np.zeros(n),  # cmd_tau
+        np.ones(n) * 100.0,  # kp
+        np.ones(n) * 5.0,  # kd
     )
 
 
@@ -57,7 +54,10 @@ def test_slew_clamp_limits_delta_q(monkeypatch):
     d = Dampener()
     q1 = np.zeros(4)
     q2 = np.array([1.0, -1.0, 0.05, 0.5])
-    kp = np.zeros(4); kd = np.zeros(4); dq = np.zeros(4); tau = np.zeros(4)
+    kp = np.zeros(4)
+    kd = np.zeros(4)
+    dq = np.zeros(4)
+    tau = np.zeros(4)
     # First call establishes prev = q1 (but cap not applied on first call yet).
     d.apply(q1, dq, tau, kp, kd, None)
     qo, *_ = d.apply(q2, dq, tau, kp, kd, None)
@@ -71,7 +71,10 @@ def test_q_limit_clip_respects_bounds(monkeypatch):
     monkeypatch.setenv("HOLOSOMA_Q_LIMIT_SCALE", "1.0")
     d = Dampener(joint_limits_lo=[-1.0, -1.0], joint_limits_hi=[1.0, 1.0])
     q = np.array([5.0, -5.0])
-    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    kp = np.zeros(2)
+    kd = np.zeros(2)
+    dq = np.zeros(2)
+    tau = np.zeros(2)
     qo, *_ = d.apply(q, dq, tau, kp, kd, None)
     assert np.allclose(qo, [1.0, -1.0])
 
@@ -80,7 +83,10 @@ def test_q_limit_clip_scaled(monkeypatch):
     monkeypatch.setenv("HOLOSOMA_Q_LIMIT_SCALE", "0.5")
     d = Dampener(joint_limits_lo=[-1.0, -1.0], joint_limits_hi=[1.0, 1.0])
     q = np.array([5.0, -5.0])
-    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    kp = np.zeros(2)
+    kd = np.zeros(2)
+    dq = np.zeros(2)
+    tau = np.zeros(2)
     qo, *_ = d.apply(q, dq, tau, kp, kd, None)
     # Scale=0.5 halves the range, centered on midpoint 0.
     assert np.allclose(qo, [0.5, -0.5])
@@ -91,7 +97,10 @@ def test_blend_alpha_zero_freezes_at_current(monkeypatch):
     d = Dampener()
     q = np.array([10.0, 10.0])
     cur = np.array([1.5, -0.5])
-    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    kp = np.zeros(2)
+    kd = np.zeros(2)
+    dq = np.zeros(2)
+    tau = np.zeros(2)
     qo, *_ = d.apply(q, dq, tau, kp, kd, cur)
     assert np.allclose(qo, cur)
 
@@ -101,7 +110,10 @@ def test_blend_alpha_half_is_midpoint(monkeypatch):
     d = Dampener()
     q = np.array([1.0, 1.0])
     cur = np.array([3.0, -1.0])
-    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    kp = np.zeros(2)
+    kd = np.zeros(2)
+    dq = np.zeros(2)
+    tau = np.zeros(2)
     qo, *_ = d.apply(q, dq, tau, kp, kd, cur)
     assert np.allclose(qo, [2.0, 0.0])
 
@@ -117,6 +129,7 @@ def test_policy_base_reset_hook_calls_dampener_reset():
     prior q_target. Keeps the test isolated from the full BasePolicy
     construction graph (which requires ONNX + torch).
     """
+
     class _MockInterface:
         pass
 
@@ -125,7 +138,10 @@ def test_policy_base_reset_hook_calls_dampener_reset():
     iface._dampener = d
 
     # Populate prior q_target via a first apply().
-    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    kp = np.zeros(2)
+    kd = np.zeros(2)
+    dq = np.zeros(2)
+    tau = np.zeros(2)
     d.apply(np.array([1.0, 2.0]), dq, tau, kp, kd, None)
     assert d._prev_q_out is not None
 
@@ -137,7 +153,9 @@ def test_policy_base_reset_hook_calls_dampener_reset():
         if dmp is not None:
             try:
                 dmp.reset()
-            except Exception:
+            except Exception:  # noqa: S110
+                # Mirrors the real hook: Dampener.reset() is
+                # best-effort; interface may be a test double.
                 pass
 
     _reset(iface)
@@ -147,7 +165,10 @@ def test_policy_base_reset_hook_calls_dampener_reset():
 def test_reset_clears_slew_memory(monkeypatch):
     monkeypatch.setenv("HOLOSOMA_Q_SLEW_PER_TICK", "0.1")
     d = Dampener()
-    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    kp = np.zeros(2)
+    kd = np.zeros(2)
+    dq = np.zeros(2)
+    tau = np.zeros(2)
     d.apply(np.zeros(2), dq, tau, kp, kd, None)
     d.apply(np.array([1.0, 1.0]), dq, tau, kp, kd, None)  # clamped
     d.reset()
@@ -170,10 +191,13 @@ def test_q_limit_clip_skips_unlimited_joints(monkeypatch):
         joint_limits_hi=[1.0, np.inf],
     )
     q = np.array([5.0, 5.0])
-    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    kp = np.zeros(2)
+    kd = np.zeros(2)
+    dq = np.zeros(2)
+    tau = np.zeros(2)
     qo, *_ = d.apply(q, dq, tau, kp, kd, None)
-    assert qo[0] == pytest.approx(1.0)       # limited → clipped
-    assert qo[1] == pytest.approx(5.0)       # unlimited → passthrough
+    assert qo[0] == pytest.approx(1.0)  # limited → clipped
+    assert qo[1] == pytest.approx(5.0)  # unlimited → passthrough
     assert np.all(np.isfinite(qo))
 
 
@@ -185,7 +209,10 @@ def test_q_limit_clip_all_unlimited_is_noop(monkeypatch):
         joint_limits_hi=[np.inf, np.inf],
     )
     q = np.array([5.0, -5.0])
-    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    kp = np.zeros(2)
+    kd = np.zeros(2)
+    dq = np.zeros(2)
+    tau = np.zeros(2)
     qo, *_ = d.apply(q, dq, tau, kp, kd, None)
     assert np.allclose(qo, q)
     assert np.all(np.isfinite(qo))

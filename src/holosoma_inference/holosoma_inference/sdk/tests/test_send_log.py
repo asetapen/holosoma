@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -13,7 +12,7 @@ from holosoma_inference.sdk.send_log import SendLogger
 @pytest.fixture
 def tmp_log_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("HOLOSOMA_SEND_LOG_DIR", str(tmp_path))
-    yield tmp_path
+    return tmp_path
 
 
 def test_disabled_by_default_writes_nothing(tmp_log_dir, monkeypatch):
@@ -57,7 +56,7 @@ def test_truncates_q_target_by_default(tmp_log_dir, monkeypatch):
     monkeypatch.delenv("HOLOSOMA_SEND_LOG_FULL", raising=False)
     log = SendLogger()
     log.maybe_log(q_target=list(range(29)), kp=[100.0] * 29, kd=[5.0] * 29)
-    rec = json.loads(list(tmp_log_dir.glob("*.jsonl"))[0].read_text().splitlines()[0])
+    rec = json.loads(next(iter(tmp_log_dir.glob("*.jsonl"))).read_text().splitlines()[0])
     assert len(rec["q_target"]) == 6
 
 
@@ -67,6 +66,6 @@ def test_logs_full_q_target_when_requested(tmp_log_dir, monkeypatch):
     monkeypatch.setenv("HOLOSOMA_SEND_LOG_FULL", "1")
     log = SendLogger()
     log.maybe_log(q_target=list(range(29)), kp=[100.0] * 29, kd=[5.0] * 29)
-    rec = json.loads(list(tmp_log_dir.glob("*.jsonl"))[0].read_text().splitlines()[0])
+    rec = json.loads(next(iter(tmp_log_dir.glob("*.jsonl"))).read_text().splitlines()[0])
     assert len(rec["q_target"]) == 29
     assert rec["q_target"][-1] == 28.0

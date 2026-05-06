@@ -21,7 +21,7 @@ HOLOSOMA_SEND_LOG_INCLUDE_STATE  "1" to call read_low_state each log frame
                                  (slower; only useful on hardware).
 HOLOSOMA_SEND_LOG_FULL           "1" to log all 29 joint values instead of
                                  just the first 6 (default off; files grow
-                                 ~4.8× when enabled). Enable when the
+                                 ~4.8x when enabled). Enable when the
                                  analyzer needs upper-body coverage.
 """
 
@@ -31,7 +31,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -51,8 +51,8 @@ class SendLogger:
 
     def __init__(self) -> None:
         self._counter = 0
-        self._path: Optional[Path] = None
-        self._enabled_cached: Optional[bool] = None
+        self._path: Path | None = None
+        self._enabled_cached: bool | None = None
 
     @property
     def enabled(self) -> bool:
@@ -104,10 +104,13 @@ class SendLogger:
                     "dq": [float(v) for v in dq_list],
                     "imu_quat": [float(v) for v in list(state.imu.quat)],
                 }
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 record["state_error"] = repr(exc)
         try:
             with open(self._resolve_path(), "a") as f:
                 f.write(json.dumps(record) + "\n")
-        except Exception:  # noqa: BLE001
-            pass  # Never crash the control loop.
+        except Exception:  # noqa: S110
+            # Deliberate: never crash the control loop on a log-write
+            # failure. The logger is diagnostic and must not influence
+            # the inference tick cadence.
+            pass

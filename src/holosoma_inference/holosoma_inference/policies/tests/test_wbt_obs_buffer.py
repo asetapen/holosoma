@@ -19,7 +19,6 @@ import numpy as np
 
 from holosoma_inference.policies.wbt import WholeBodyTrackingPolicy
 
-
 NUM_DOFS = 29
 
 
@@ -39,9 +38,7 @@ def _bare_policy() -> WholeBodyTrackingPolicy:
     policy.config = SimpleNamespace(task=SimpleNamespace(debug=SimpleNamespace(force_upright_imu=False)))
     # Real ``_get_ref_body_orientation_in_world`` requires a pinocchio robot;
     # stub to a deterministic wxyz identity so the frame-subtract path works.
-    policy._get_ref_body_orientation_in_world = lambda _state: np.array(
-        [[1.0, 0.0, 0.0, 0.0]], dtype=np.float32
-    )
+    policy._get_ref_body_orientation_in_world = lambda _state: np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
     policy._remove_yaw_offset = lambda quat_wxyz, _offset: quat_wxyz
     return policy
 

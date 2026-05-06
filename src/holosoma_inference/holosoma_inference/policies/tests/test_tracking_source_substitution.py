@@ -30,7 +30,6 @@ import pytest
 from holosoma_inference.policies.tracking_source import NullTrackingSource, TrackingPayload
 from holosoma_inference.policies.wbt import WholeBodyTrackingPolicy
 
-
 # ----------------------------------------------------------------------
 # Fixtures
 # ----------------------------------------------------------------------
@@ -155,7 +154,9 @@ class TestRetargetHelper:
         fake_dq = np.zeros(29, dtype=np.float32)
         fake_retargeter = MagicMock()
         fake_retargeter.retarget.return_value = (
-            fake_q, fake_dq, np.array([np.nan, 0.0, 0.0, 0.0], dtype=np.float32),
+            fake_q,
+            fake_dq,
+            np.array([np.nan, 0.0, 0.0, 0.0], dtype=np.float32),
         )
         policy._retargeter = fake_retargeter
 
@@ -229,9 +230,7 @@ def _stub_rl_inference_deps(policy: WholeBodyTrackingPolicy) -> MagicMock:
     Returns the MagicMock standing in for ``self.policy`` (the ONNX
     session wrapper), so tests can assert on its motion_command output.
     """
-    policy.prepare_obs_for_rl = MagicMock(
-        return_value={"actor_obs": np.zeros((1, 1), dtype=np.float32)}
-    )
+    policy.prepare_obs_for_rl = MagicMock(return_value={"actor_obs": np.zeros((1, 1), dtype=np.float32)})
     onnx_motion = np.full((1, 58), 9.99, dtype=np.float32)
     onnx_action = np.zeros((1, 29), dtype=np.float32)
     onnx_ref_quat = np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32)

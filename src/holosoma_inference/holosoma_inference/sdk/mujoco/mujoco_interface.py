@@ -18,7 +18,6 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -50,10 +49,10 @@ def _resolve_mjcf_path(robot_config: RobotConfig) -> Path:
 
     # Fallback: resolve against the holosoma_retargeting package.
     try:
-        import holosoma_retargeting  # type: ignore
+        import holosoma_retargeting  # type: ignore[import-not-found]
 
         pkg_root = Path(holosoma_retargeting.__file__).parent
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise FileNotFoundError(
             "Could not locate MJCF for MuJoCo backend; set HOLOSOMA_MUJOCO_MJCF or "
             "populate robot_config.urdf_path with a .xml path"
@@ -93,7 +92,7 @@ class MujocoInterface(BaseInterface):
         self,
         robot_config: RobotConfig,
         domain_id: int = 0,
-        interface_str: Optional[str] = None,
+        interface_str: str | None = None,
         use_joystick: bool = True,
     ):
         super().__init__(robot_config, domain_id, interface_str, use_joystick)
@@ -118,8 +117,7 @@ class MujocoInterface(BaseInterface):
             jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
             if jid < 0:
                 raise KeyError(
-                    f"MJCF at {mjcf_path} has no joint named {name!r}; "
-                    "robot_config.dof_names does not match the model."
+                    f"MJCF at {mjcf_path} has no joint named {name!r}; robot_config.dof_names does not match the model."
                 )
             self._dof_qpos_idx[j_id] = int(self.model.jnt_qposadr[jid])
             self._dof_qvel_idx[j_id] = int(self.model.jnt_dofadr[jid])
@@ -150,10 +148,7 @@ class MujocoInterface(BaseInterface):
         # mask a corrupt-MJCF situation.
         actfrc_lo = np.full(robot_config.num_joints, -np.inf)
         actfrc_hi = np.full(robot_config.num_joints, np.inf)
-        if (
-            hasattr(self.model, "jnt_actfrcrange")
-            and self.model.jnt_actfrcrange is not None
-        ):
+        if hasattr(self.model, "jnt_actfrcrange") and self.model.jnt_actfrcrange is not None:
             for j_id, name in enumerate(robot_config.dof_names):
                 jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
                 rng = self.model.jnt_actfrcrange[jid]
@@ -219,9 +214,7 @@ class MujocoInterface(BaseInterface):
             base_ang_vel = self.data.qvel[3:6].copy()
             joint_vel = self.data.qvel[self._dof_qvel_idx].copy()
 
-        return np.concatenate(
-            [base_pos, quat, joint_pos, base_lin_vel, base_ang_vel, joint_vel]
-        ).reshape(1, -1)
+        return np.concatenate([base_pos, quat, joint_pos, base_lin_vel, base_ang_vel, joint_vel]).reshape(1, -1)
 
     def send_low_command(
         self,
@@ -318,7 +311,7 @@ class MujocoInterface(BaseInterface):
             return
         latest = getattr(self, "_latest_cmd", None)
         ts = float(self.model.opt.timestep)
-        n_steps = max(1, int(round(duration / ts)))
+        n_steps = max(1, round(duration / ts))
         for _ in range(n_steps):
             if latest is not None:
                 self._apply_pd_torque(latest)

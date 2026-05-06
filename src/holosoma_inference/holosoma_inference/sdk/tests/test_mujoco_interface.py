@@ -7,9 +7,6 @@ otherwise so the dampening tests remain runnable on every platform.
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -58,7 +55,7 @@ def test_construct_and_default_pose(iface):
     state = iface.get_low_state()
     # Shape: 3 + 4 + 29 + 3 + 3 + 29 = 71
     assert state.shape == (1, 3 + 4 + 29 + 3 + 3 + 29)
-    joint_pos = state[0, 7:7 + 29]
+    joint_pos = state[0, 7 : 7 + 29]
     defaults = np.array(G1_CONFIG.default_dof_angles)
     assert np.allclose(joint_pos, defaults, atol=1e-6)
 
@@ -84,11 +81,15 @@ def test_pd_torque_expected_value(iface):
     knee_idx = G1_CONFIG.dof_names.index("left_knee_joint")
     target = np.array(G1_CONFIG.default_dof_angles, dtype=np.float64)
     target[knee_idx] += 0.1  # delta = 0.1
-    kp = np.zeros(29); kp[knee_idx] = 50.0
+    kp = np.zeros(29)
+    kp[knee_idx] = 50.0
     kd = np.zeros(29)
     iface.send_low_command(
-        cmd_q=target, cmd_dq=np.zeros(29), cmd_tau=np.zeros(29),
-        kp_override=kp, kd_override=kd,
+        cmd_q=target,
+        cmd_dq=np.zeros(29),
+        cmd_tau=np.zeros(29),
+        kp_override=kp,
+        kd_override=kd,
     )
     iface._apply_pd_torque(iface._latest_cmd)
     knee_dofadr = iface._dof_qvel_idx[knee_idx]
@@ -115,7 +116,7 @@ def test_nonzero_pd_drives_toward_target(iface):
             kd_override=kd,
         )
         iface.step(1)
-    final_q = iface.get_low_state()[0, 7:7 + 29]
+    final_q = iface.get_low_state()[0, 7 : 7 + 29]
     assert abs(final_q[shoulder_idx] - 1.0) < 0.15, f"shoulder={final_q[shoulder_idx]}"
 
 
@@ -134,7 +135,8 @@ def test_dampening_q_limit_clip_engages(iface, monkeypatch):
     target = np.array(G1_CONFIG.default_dof_angles, dtype=np.float64)
     knee_idx = G1_CONFIG.dof_names.index("left_knee_joint")
     target[knee_idx] = -3.94  # the exact value from the 05-02 hardware run
-    kp = np.zeros(29); kd = np.zeros(29)
+    kp = np.zeros(29)
+    kd = np.zeros(29)
     iface.send_low_command(target, np.zeros(29), np.zeros(29), kp_override=kp, kd_override=kd)
     # The dampener's prev_q_out is the clipped target.
     assert iface._dampener._prev_q_out is not None
@@ -171,9 +173,7 @@ def test_init_pelvis_freejoint_placed_feet_on_floor(iface):
     # the shipped default_dof_angles are applied).
     foot_zs = []
     for foot_name in ("left_ankle_roll_link", "right_ankle_roll_link"):
-        bid = iface._mujoco.mj_name2id(
-            iface.model, iface._mujoco.mjtObj.mjOBJ_BODY, foot_name
-        )
+        bid = iface._mujoco.mj_name2id(iface.model, iface._mujoco.mjtObj.mjOBJ_BODY, foot_name)
         assert bid >= 0, f"missing body {foot_name} in MJCF"
         foot_zs.append(float(iface.data.xpos[bid, 2]))
     assert min(foot_zs) < 0.02, f"neither foot near floor; foot_zs={foot_zs}"
@@ -206,19 +206,20 @@ def test_actfrcrange_clip_and_cache(iface):
     kp = np.full(29, 10_000.0)  # would produce |tau| >> any declared range
     kd = np.zeros(29)
     iface.send_low_command(
-        cmd_q=cmd_q, cmd_dq=cmd_dq, cmd_tau=cmd_tau,
-        kp_override=kp, kd_override=kd,
+        cmd_q=cmd_q,
+        cmd_dq=cmd_dq,
+        cmd_tau=cmd_tau,
+        kp_override=kp,
+        kd_override=kd,
     )
     iface.step(1)
     # Read back what was written into qfrc_applied at the cached dof indices.
     written = iface.data.qfrc_applied[iface._dof_qvel_idx]
     assert np.all(written >= iface._actfrc_lo - 1e-6), (
-        f"some joints below actfrc_lo: diffs="
-        f"{(written - iface._actfrc_lo)[written < iface._actfrc_lo].tolist()}"
+        f"some joints below actfrc_lo: diffs={(written - iface._actfrc_lo)[written < iface._actfrc_lo].tolist()}"
     )
     assert np.all(written <= iface._actfrc_hi + 1e-6), (
-        f"some joints above actfrc_hi: diffs="
-        f"{(iface._actfrc_hi - written)[written > iface._actfrc_hi].tolist()}"
+        f"some joints above actfrc_hi: diffs={(iface._actfrc_hi - written)[written > iface._actfrc_hi].tolist()}"
     )
     # Sanity: at least one joint was actually saturated (otherwise the
     # test isn't exercising the clip path).
@@ -241,22 +242,23 @@ def test_init_gravity_hold_stays_upright(iface):
     pelvis_z_start = float(iface.data.qpos[2])
     for _ in range(100):
         iface.send_low_command(
-            cmd_q=target, cmd_dq=np.zeros(29), cmd_tau=np.zeros(29),
-            kp_override=kp, kd_override=kd,
+            cmd_q=target,
+            cmd_dq=np.zeros(29),
+            cmd_tau=np.zeros(29),
+            kp_override=kp,
+            kd_override=kd,
         )
         iface.step(1)
     pelvis_z_end = float(iface.data.qpos[2])
     # Accept some settling (a few cm) but reject "robot through floor".
     assert pelvis_z_end > pelvis_z_start - 0.15, (
-        f"pelvis fell from {pelvis_z_start:.3f} to {pelvis_z_end:.3f} — "
-        "initialization may be misplaced"
+        f"pelvis fell from {pelvis_z_start:.3f} to {pelvis_z_end:.3f} — initialization may be misplaced"
     )
     # And no joint has blown through MJCF range
-    joint_pos = iface.get_low_state()[0, 7:7 + 29]
+    joint_pos = iface.get_low_state()[0, 7 : 7 + 29]
     lo = iface._joint_limits_lo
     hi = iface._joint_limits_hi
     violations = np.where((joint_pos < lo - 0.1) | (joint_pos > hi + 0.1))[0]
     assert len(violations) == 0, (
-        f"joints blew past range: indices={violations.tolist()}, "
-        f"values={joint_pos[violations].tolist()}"
+        f"joints blew past range: indices={violations.tolist()}, values={joint_pos[violations].tolist()}"
     )

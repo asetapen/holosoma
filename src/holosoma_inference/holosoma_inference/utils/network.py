@@ -1,20 +1,22 @@
 """Network interface auto-detection for robot communication."""
 
-import os
+from pathlib import Path
 
 _SKIP_PREFIXES = ("lo", "wl", "docker", "br-", "veth", "virbr", "vnet", "tun", "tap")
 
 
 def detect_robot_interface() -> str:
     """Return the name of the single wired NIC that is operationally UP."""
-    for ifname in sorted(os.listdir("/sys/class/net/")):
+    net_root = Path("/sys/class/net")
+    for iface in sorted(net_root.iterdir()):
+        ifname = iface.name
         if any(ifname.startswith(p) for p in _SKIP_PREFIXES):
             continue
         try:
-            with open(f"/sys/class/net/{ifname}/operstate") as f:
-                if f.read().strip().lower() != "up":
-                    continue
+            state = (iface / "operstate").read_text().strip().lower()
         except OSError:
+            continue
+        if state != "up":
             continue
         print(f"[network] auto-detected interface: {ifname}")
         return ifname

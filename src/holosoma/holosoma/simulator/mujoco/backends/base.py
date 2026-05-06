@@ -10,10 +10,9 @@ from __future__ import annotations
 import abc
 from typing import TYPE_CHECKING
 
+import mujoco
 import numpy as np
 import torch
-
-import mujoco
 
 if TYPE_CHECKING:
     from holosoma.config_types.full_sim import FullSimConfig

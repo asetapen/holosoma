@@ -3,7 +3,7 @@
 Runs the shipped ONNX policy headless over ``pico_example_long.mcap``
 and asserts two invariants:
 
-  1. ``dof_pos`` (post-PD sim state) stays within MJCF joint range × 0.95.
+  1. ``dof_pos`` (post-PD sim state) stays within MJCF joint range x 0.95.
      This is a HARD CI GATE — the sim auto-clamps at the joint range,
      so a failure here means the sim itself couldn't keep the robot
      within bounds, which would be a serious regression.
@@ -43,10 +43,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import struct
-import subprocess
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -105,6 +102,7 @@ def _require(path: Path) -> None:
 def _mjcf_joint_limits(dof_names):
     """Return ``(lo, hi)`` as arrays aligned to dof_names order."""
     import mujoco
+
     import holosoma_retargeting as _hr
 
     mjcf = Path(_hr.__file__).resolve().parent / "models" / "g1" / "g1_29dof.xml"
@@ -189,20 +187,18 @@ def _policy_run():
     pytest.skip(msg)
 
 
-def test_dof_pos_within_joint_limits(_policy_run):
-    """Hard gate: sim dof_pos stays within MJCF joint range × 0.95."""
+def test_dof_pos_within_joint_limits(_policy_run):  # noqa: PT019
+    """Hard gate: sim dof_pos stays within MJCF joint range x 0.95."""
     debug_npz = _policy_run
     d = np.load(debug_npz)
     assert "dof_pos" in d.files, (
-        f"debug NPZ {debug_npz} is missing 'dof_pos'; policy run did not "
-        "produce a complete debug log."
+        f"debug NPZ {debug_npz} is missing 'dof_pos'; policy run did not produce a complete debug log."
     )
     dof_pos = np.asarray(d["dof_pos"])
     onnx_path = Path(os.environ.get("HOLOSOMA_TEST_ONNX", _ACTIVE_ONNX))
     dof_names, _default_q, _scale = _onnx_policy_metadata(onnx_path)
     assert dof_pos.shape[1] == len(dof_names), (
-        f"debug dof_pos has {dof_pos.shape[1]} columns, ONNX has "
-        f"{len(dof_names)} joints."
+        f"debug dof_pos has {dof_pos.shape[1]} columns, ONNX has {len(dof_names)} joints."
     )
 
     lo, hi = _mjcf_joint_limits(dof_names)
@@ -219,16 +215,14 @@ def test_dof_pos_within_joint_limits(_policy_run):
     if violations_per_dof.sum() == 0:
         return
 
-    msg = ["sim dof_pos escaped MJCF limits × 0.95 on some frames:"]
+    msg = ["sim dof_pos escaped MJCF limits x 0.95 on some frames:"]
     for j, name in enumerate(dof_names):
         n_bad = int(violations_per_dof[j])
         if n_bad == 0:
             continue
         col = dof_pos[:, j]
         msg.append(
-            f"  {name}: {n_bad} frames, "
-            f"range=[{lo[j]:.3f},{hi[j]:.3f}] "
-            f"observed=[{col.min():.3f},{col.max():.3f}]"
+            f"  {name}: {n_bad} frames, range=[{lo[j]:.3f},{hi[j]:.3f}] observed=[{col.min():.3f},{col.max():.3f}]"
         )
     pytest.fail("\n".join(msg))
 
@@ -238,9 +232,9 @@ def test_dof_pos_within_joint_limits(_policy_run):
     "1 rad. Upstream policy retraining will unblock this. See "
     "HANDOFF-2026-05-04 policy-safety analysis.",
     strict=True,  # if policy retrains and this suddenly passes, flip
-                  # the marker off — we want to know.
+    # the marker off — we want to know.
 )
-def test_q_target_within_joint_limits(_policy_run):
+def test_q_target_within_joint_limits(_policy_run):  # noqa: PT019
     """Tracking metric: commanded set-point (action*scale + default) in range.
 
     Currently XFAIL — policy output has known out-of-range commands. When
@@ -269,14 +263,12 @@ def test_q_target_within_joint_limits(_policy_run):
             continue
         col = q_target[:, j]
         msg.append(
-            f"  {name}: {n_bad} frames, "
-            f"range=[{lo[j]:.3f},{hi[j]:.3f}] "
-            f"observed=[{col.min():.3f},{col.max():.3f}]"
+            f"  {name}: {n_bad} frames, range=[{lo[j]:.3f},{hi[j]:.3f}] observed=[{col.min():.3f},{col.max():.3f}]"
         )
     pytest.fail("\n".join(msg))
 
 
-def test_dof_pos_slew_bounded(_policy_run):
+def test_dof_pos_slew_bounded(_policy_run):  # noqa: PT019
     """Per-tick slew (|Δq_target|) stays within 0.5 rad on each DOF.
 
     0.5 rad / tick at 50 Hz = 25 rad/s — a soft upper bound that
@@ -296,11 +288,7 @@ def test_dof_pos_slew_bounded(_policy_run):
 
     onnx_path = Path(os.environ.get("HOLOSOMA_TEST_ONNX", _ACTIVE_ONNX))
     dof_names, _, _ = _onnx_policy_metadata(onnx_path)
-    bad = [
-        (dof_names[j], float(per_dof_max[j]))
-        for j in range(len(dof_names))
-        if per_dof_max[j] > thresh
-    ]
+    bad = [(dof_names[j], float(per_dof_max[j])) for j in range(len(dof_names)) if per_dof_max[j] > thresh]
     bad.sort(key=lambda t: -t[1])
     lines = [f"per-tick dof_pos slew exceeds {thresh} rad:"]
     for name, v in bad[:5]:

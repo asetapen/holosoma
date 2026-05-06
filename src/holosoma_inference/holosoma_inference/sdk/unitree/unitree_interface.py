@@ -1,8 +1,9 @@
 """Unitree robot interface using C++/pybind11 binding."""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 from loguru import logger
@@ -13,7 +14,7 @@ from holosoma_inference.sdk.dampening import Dampener
 from holosoma_inference.sdk.send_log import SendLogger
 
 
-def _load_joint_limits_from_mjcf(robot_config: RobotConfig) -> Optional[tuple[np.ndarray, np.ndarray]]:
+def _load_joint_limits_from_mjcf(robot_config: RobotConfig) -> tuple[np.ndarray, np.ndarray] | None:
     """Best-effort MJCF joint-limit lookup for the dampening clip knob.
 
     The Unitree hardware path has no joint-range info in RobotConfig today,
@@ -37,7 +38,7 @@ def _load_joint_limits_from_mjcf(robot_config: RobotConfig) -> Optional[tuple[np
     if urdf and urdf.endswith(".xml"):
         candidates.append(Path(urdf))
     try:
-        import holosoma_retargeting  # type: ignore
+        import holosoma_retargeting  # type: ignore[import-not-found]
 
         candidates.append(
             Path(holosoma_retargeting.__file__).parent
@@ -45,14 +46,15 @@ def _load_joint_limits_from_mjcf(robot_config: RobotConfig) -> Optional[tuple[np
             / robot_config.robot
             / f"{robot_config.robot_type}.xml"
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("holosoma_retargeting path probe failed: {}", exc)
     for path in candidates:
         if not path.is_file():
             continue
         try:
             model = mujoco.MjModel.from_xml_path(str(path))
-        except Exception:
+        except Exception as exc:
+            logger.debug("MJCF load failed at {}: {}", path, exc)
             continue
         lo = np.full(robot_config.num_joints, -np.inf)
         hi = np.full(robot_config.num_joints, np.inf)
@@ -107,7 +109,6 @@ class UnitreeInterface(BaseInterface):
         # endpoints, and the robot firmware latches onto one — the other's
         # write_low_command calls fall on the floor with no visible error.
         import os as _os
-        import sys as _sys
 
         cyclonedds_uri = _os.environ.get("CYCLONEDDS_URI", "<unset>")
         cyclonedds_domain = _os.environ.get("CYCLONEDDS_DOMAIN", "<unset>")
@@ -123,8 +124,12 @@ class UnitreeInterface(BaseInterface):
                 "[unitree_interface] pid={} ppid={} iface={} "
                 "python_domain_id_arg={} C++_domain_id=0 (hardcoded) "
                 "ROS_DOMAIN_ID={} CYCLONEDDS_DOMAIN={} CYCLONEDDS_URI_set={}",
-                _os.getpid(), _os.getppid(), self.interface_str,
-                self.domain_id, ros_domain_id, cyclonedds_domain,
+                _os.getpid(),
+                _os.getppid(),
+                self.interface_str,
+                self.domain_id,
+                ros_domain_id,
+                cyclonedds_domain,
                 cyclonedds_uri != "<unset>",
             )
 
