@@ -89,15 +89,6 @@ Service-mode deployments surface three safety invariants:
 3. The dampening shim's joint-limit clip skips unlimited joints
    instead of producing NaN via `0.5 * (-inf + +inf)`.
 
-### Diagnostic harnesses
-
-Pipeline-adjacent viewers and bench CLIs (the `three_panel_eval` motion
--correctness video, the dual-G1 `policy_output_viewer`, the live
-`pico_live_viewer`, the retargeter and ONNX benches) live in the
-caller-side FAR-pi tree under
-`holosoma_extensions/src/extensions/holosoma_tools/`. They depend on
-FAR-pi-owned fixtures and are not part of this library.
-
 ---
 
 # Policy Controls
