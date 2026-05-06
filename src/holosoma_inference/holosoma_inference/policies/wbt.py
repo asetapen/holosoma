@@ -97,6 +97,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._retargeter = None  # type: ignore[var-annotated]
         self._retargeter_init_failed = False
         self._retargeter_runtime_warned = False
+        # Walker 2026-05-05 finding #6: track how many frames have fallen
+        # through after the first WARN, and re-warn periodically so an
+        # operator who misses the one-shot log line still sees that the
+        # retargeter is no-op'ing (the 2026-05-02 analysis found a 30-
+        # minute silent retargeter OOM this would have caught).
+        self._retargeter_runtime_err_count = 0
+        self._retargeter_runtime_last_warn_count = 0
+        # Re-WARN every ~500 frames (= ~10 s at 50 Hz).
+        self._retargeter_runtime_rewarn_every = 500
 
         # initialize motion state
         self.motion_clip_progressing = False
@@ -475,6 +484,51 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         return self.scaled_policy_action
 
+    def _retargeter_warn(self, reason: str) -> None:
+        """Log a retargeter-fallthrough WARN once, then throttled re-WARNs.
+
+        First call prints the reason + intent to suppress. Every
+        `_retargeter_runtime_rewarn_every` calls after that, we log
+        again with the accumulated count so silent-failure stretches
+        are visible in logs.
+        """
+        self._retargeter_runtime_err_count += 1
+        if not self._retargeter_runtime_warned:
+            logger.warning(
+                "WBT tracking_source: {} — falling through to ONNX-clip "
+                "motion_command. Subsequent failures suppressed; a periodic "
+                "re-WARN will fire every {} frames.",
+                reason,
+                self._retargeter_runtime_rewarn_every,
+            )
+            self._retargeter_runtime_warned = True
+            self._retargeter_runtime_last_warn_count = 1
+            return
+        delta = (
+            self._retargeter_runtime_err_count - self._retargeter_runtime_last_warn_count
+        )
+        if delta >= self._retargeter_runtime_rewarn_every:
+            logger.warning(
+                "WBT tracking_source: retargeter still failing — "
+                "{} total fallthroughs so far (last reason: {}).",
+                self._retargeter_runtime_err_count,
+                reason,
+            )
+            self._retargeter_runtime_last_warn_count = (
+                self._retargeter_runtime_err_count
+            )
+
+    def _reset_retargeter_runtime_state(self) -> None:
+        """Clear the one-shot WARN latch + error counter.
+
+        Called on policy stop/start transitions so a transient tracker
+        glitch at the start of a session doesn't silence every future
+        failure in the process lifetime (walker 2026-05-05 #6).
+        """
+        self._retargeter_runtime_warned = False
+        self._retargeter_runtime_err_count = 0
+        self._retargeter_runtime_last_warn_count = 0
+
     def _retarget_payload_to_motion_command(
         self, payload
     ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -537,35 +591,22 @@ class WholeBodyTrackingPolicy(BasePolicy):
         try:
             transforms = np.asarray(payload.joint_transforms, dtype=np.float32).reshape(24, 7)
         except (ValueError, AttributeError) as exc:
-            if not self._retargeter_runtime_warned:
-                logger.warning(
-                    f"WBT tracking_source: joint_transforms reshape to (24, 7) failed ({exc!r}); "
-                    "falling through to ONNX-clip motion_command. Further failures suppressed."
-                )
-                self._retargeter_runtime_warned = True
+            self._retargeter_warn(f"joint_transforms reshape to (24, 7) failed ({exc!r})")
             return None
 
         try:
             q_joints, dq_joints, root_orn_wxyz = self._retargeter.retarget(transforms)
         except Exception as exc:  # noqa: BLE001
-            if not self._retargeter_runtime_warned:
-                logger.warning(
-                    f"WBT tracking_source: SMPLRetargeter.retarget raised {exc!r}; "
-                    "falling through to ONNX-clip motion_command. Further failures suppressed."
-                )
-                self._retargeter_runtime_warned = True
+            self._retargeter_warn(f"SMPLRetargeter.retarget raised {exc!r}")
             return None
 
         q_joints = np.asarray(q_joints, dtype=np.float32).reshape(-1)
         dq_joints = np.asarray(dq_joints, dtype=np.float32).reshape(-1)
         if q_joints.size != self.num_dofs or dq_joints.size != self.num_dofs:
-            if not self._retargeter_runtime_warned:
-                logger.warning(
-                    f"WBT tracking_source: retargeter returned unexpected dim "
-                    f"(q={q_joints.size}, dq={dq_joints.size}, expected={self.num_dofs}); "
-                    "falling through to ONNX-clip motion_command."
-                )
-                self._retargeter_runtime_warned = True
+            self._retargeter_warn(
+                f"retargeter returned unexpected dim "
+                f"(q={q_joints.size}, dq={dq_joints.size}, expected={self.num_dofs})"
+            )
             return None
 
         motion_command = np.concatenate([q_joints, dq_joints]).reshape(1, -1)
@@ -580,13 +621,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # last valid value rather than propagating garbage into the obs.
         root_orn_wxyz = np.asarray(root_orn_wxyz, dtype=np.float32).reshape(-1)
         if root_orn_wxyz.size != 4 or not np.all(np.isfinite(root_orn_wxyz)):
-            if not self._retargeter_runtime_warned:
-                logger.warning(
-                    f"WBT tracking_source: retargeter root_orn_wxyz invalid "
-                    f"(size={root_orn_wxyz.size}); keeping previous ref_quat_xyzw_t. "
-                    "Further failures suppressed."
-                )
-                self._retargeter_runtime_warned = True
+            self._retargeter_warn(
+                f"retargeter root_orn_wxyz invalid (size={root_orn_wxyz.size}); "
+                "keeping previous ref_quat_xyzw_t"
+            )
             return motion_command, None
 
         # wxyz -> xyzw: (w, x, y, z) -> (x, y, z, w).
@@ -671,6 +709,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._stiff_hold_active = False
         self._capture_robot_yaw_offset()
         self._capture_motion_yaw_offset(self.ref_quat_xyzw_0)
+        # Walker 2026-05-05 #6: clear the retargeter one-shot WARN latch
+        # so a transient tracker glitch at the start of a session doesn't
+        # silence every future failure in the process lifetime.
+        self._reset_retargeter_runtime_state()
 
     def _set_motion_timestep(self):
         if self.motion_clip_progressing:
@@ -706,6 +748,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_command_t = self.motion_command_0.copy()
         self.robot_yaw_offset = 0.0
         self.motion_yaw_offset = 0.0
+        # Walker 2026-05-05 #6: clear retargeter WARN latch on stop so a
+        # restart of the policy doesn't stay silent across transient faults.
+        self._reset_retargeter_runtime_state()
 
     def _handle_start_motion_clip(self):
         """Handle start motion clip action."""

@@ -812,8 +812,28 @@ class BasePolicy:
     # Control Action Methods
     # ============================================================================
 
+    def _reset_interface_dampener(self):
+        """Forget the Dampener's prior q_target across state transitions.
+
+        Slew-per-tick (q_slew_per_tick) is clamped against the last
+        post-shim output. On stiff-hold → policy-start transitions (and
+        the reverse when a fallback resumes stiff-hold) the previous
+        output reflects a different control regime; keeping it would
+        throttle the first frames of the new regime in ways the operator
+        didn't ask for. See walker 2026-05-05 finding #8.
+        """
+        d = getattr(self.interface, "_dampener", None)
+        if d is not None:
+            try:
+                d.reset()
+            except Exception:  # noqa: BLE001
+                # Best-effort. Dampener is optional; interface may be a
+                # test double that doesn't implement it.
+                pass
+
     def _handle_start_policy(self):
         """Handle start policy action."""
+        self._reset_interface_dampener()
         self.use_policy_action = True
         self.get_ready_state = False
         self.logger.info(colored("Using policy actions", "blue"))
@@ -823,6 +843,7 @@ class BasePolicy:
 
     def _handle_stop_policy(self):
         """Handle stop policy action."""
+        self._reset_interface_dampener()
         self.use_policy_action = False
         self.get_ready_state = False
         self.logger.info("Actions set to zero")
@@ -831,6 +852,7 @@ class BasePolicy:
 
     def _handle_init_state(self):
         """Handle initialization state."""
+        self._reset_interface_dampener()
         self.get_ready_state = True
         self.init_count = 0
         self.logger.info("Setting to init state")

@@ -138,6 +138,33 @@ class MujocoInterface(BaseInterface):
         self._joint_limits_lo = lo
         self._joint_limits_hi = hi
 
+        # Cache per-joint actuator-force range in dof_names order so the
+        # PD loop doesn't call mj_name2id 29x per tick. The MJCF marks a
+        # joint's force range as "declared" via jnt_actfrcrange with a
+        # non-degenerate (lo < hi) interval; for joints without a range
+        # we store (-inf, +inf) and skip clipping in _apply_pd_torque.
+        #
+        # This distinguishes "no range declared" from "range is exactly
+        # (0, 0)" — under the prior hi > lo check the latter silently
+        # no-op'd, which is indistinguishable from the former and would
+        # mask a corrupt-MJCF situation.
+        actfrc_lo = np.full(robot_config.num_joints, -np.inf)
+        actfrc_hi = np.full(robot_config.num_joints, np.inf)
+        if (
+            hasattr(self.model, "jnt_actfrcrange")
+            and self.model.jnt_actfrcrange is not None
+        ):
+            for j_id, name in enumerate(robot_config.dof_names):
+                jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                rng = self.model.jnt_actfrcrange[jid]
+                jlo, jhi = float(rng[0]), float(rng[1])
+                if jhi > jlo:
+                    actfrc_lo[j_id] = jlo
+                    actfrc_hi[j_id] = jhi
+        self._actfrc_lo = actfrc_lo
+        self._actfrc_hi = actfrc_hi
+        self._actfrc_has_range = np.isfinite(actfrc_lo) & np.isfinite(actfrc_hi)
+
         self._kp_level = 1.0
         self._kd_level = 1.0
 
@@ -301,16 +328,11 @@ class MujocoInterface(BaseInterface):
         q = self.data.qpos[self._dof_qpos_idx]
         dq = self.data.qvel[self._dof_qvel_idx]
         tau = cmd["kp"] * (cmd["q"] - q) + cmd["kd"] * (cmd["dq"] - dq) + cmd["tau"]
-        # Saturate to per-joint actuator force range if the MJCF declared
-        # actuatorfrcrange on the joints.
-        if hasattr(self.model, "jnt_actfrcrange") and self.model.jnt_actfrcrange is not None:
-            for j_id in range(self.robot_config.num_joints):
-                jid = self._mujoco.mj_name2id(
-                    self.model, self._mujoco.mjtObj.mjOBJ_JOINT, self.robot_config.dof_names[j_id]
-                )
-                lo, hi = self.model.jnt_actfrcrange[jid]
-                if hi > lo:
-                    tau[j_id] = float(np.clip(tau[j_id], lo, hi))
+        # Saturate joints with a declared actuator force range. Uses the
+        # cached (lo, hi) vectors from __init__ so this path is allocation-
+        # and name-lookup-free at 50 Hz * substep.
+        if self._actfrc_has_range.any():
+            np.clip(tau, self._actfrc_lo, self._actfrc_hi, out=tau)
         # Write into qfrc_applied at the per-joint dofadr; this bypasses
         # MuJoCo's actuator graph (we don't need it — we're doing PD outside
         # MuJoCo's motor model).

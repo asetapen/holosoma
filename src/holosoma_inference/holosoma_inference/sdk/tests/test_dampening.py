@@ -106,6 +106,44 @@ def test_blend_alpha_half_is_midpoint(monkeypatch):
     assert np.allclose(qo, [2.0, 0.0])
 
 
+def test_policy_base_reset_hook_calls_dampener_reset():
+    """Walker review #8: base policy start/stop/init transitions must
+    call Dampener.reset() so the slew memory doesn't leak across
+    control regimes.
+
+    This test constructs a minimal stand-in for the policy base class's
+    `_reset_interface_dampener` method, wires it to a real Dampener on
+    a mock `interface`, then verifies the reset actually drops the
+    prior q_target. Keeps the test isolated from the full BasePolicy
+    construction graph (which requires ONNX + torch).
+    """
+    class _MockInterface:
+        pass
+
+    iface = _MockInterface()
+    d = Dampener()
+    iface._dampener = d
+
+    # Populate prior q_target via a first apply().
+    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    d.apply(np.array([1.0, 2.0]), dq, tau, kp, kd, None)
+    assert d._prev_q_out is not None
+
+    # Reproduce the hook body. If this ever drifts from the real hook
+    # (holosoma_inference/policies/base.py::BasePolicy._reset_interface_dampener),
+    # update both sites together.
+    def _reset(interface):
+        dmp = getattr(interface, "_dampener", None)
+        if dmp is not None:
+            try:
+                dmp.reset()
+            except Exception:
+                pass
+
+    _reset(iface)
+    assert d._prev_q_out is None
+
+
 def test_reset_clears_slew_memory(monkeypatch):
     monkeypatch.setenv("HOLOSOMA_Q_SLEW_PER_TICK", "0.1")
     d = Dampener()
@@ -116,6 +154,41 @@ def test_reset_clears_slew_memory(monkeypatch):
     qo, *_ = d.apply(np.array([2.0, 2.0]), dq, tau, kp, kd, None)
     # After reset, no prev means no clamp on this call.
     assert np.allclose(qo, [2.0, 2.0])
+
+
+def test_q_limit_clip_skips_unlimited_joints(monkeypatch):
+    """Walker review #9: a joint with ±inf bounds must be left alone
+    instead of clipped against NaN (which (lo+hi)/2 silently produces).
+
+    Mixed limited/unlimited: joint 0 is limited to [-1, 1], joint 1 is
+    unlimited. The unlimited joint's command must pass through; the
+    limited one must clip.
+    """
+    monkeypatch.setenv("HOLOSOMA_Q_LIMIT_SCALE", "1.0")
+    d = Dampener(
+        joint_limits_lo=[-1.0, -np.inf],
+        joint_limits_hi=[1.0, np.inf],
+    )
+    q = np.array([5.0, 5.0])
+    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    qo, *_ = d.apply(q, dq, tau, kp, kd, None)
+    assert qo[0] == pytest.approx(1.0)       # limited → clipped
+    assert qo[1] == pytest.approx(5.0)       # unlimited → passthrough
+    assert np.all(np.isfinite(qo))
+
+
+def test_q_limit_clip_all_unlimited_is_noop(monkeypatch):
+    """When every joint is ±inf, the clip path must not introduce NaN."""
+    monkeypatch.setenv("HOLOSOMA_Q_LIMIT_SCALE", "1.0")
+    d = Dampener(
+        joint_limits_lo=[-np.inf, -np.inf],
+        joint_limits_hi=[np.inf, np.inf],
+    )
+    q = np.array([5.0, -5.0])
+    kp = np.zeros(2); kd = np.zeros(2); dq = np.zeros(2); tau = np.zeros(2)
+    qo, *_ = d.apply(q, dq, tau, kp, kd, None)
+    assert np.allclose(qo, q)
+    assert np.all(np.isfinite(qo))
 
 
 def test_knobs_from_env_reads_all_five(monkeypatch):

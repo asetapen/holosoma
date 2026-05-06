@@ -179,6 +179,56 @@ def test_init_pelvis_freejoint_placed_feet_on_floor(iface):
     assert min(foot_zs) < 0.02, f"neither foot near floor; foot_zs={foot_zs}"
 
 
+def test_actfrcrange_clip_and_cache(iface):
+    """Walker review blocker #3: actuator-force saturation must clip
+    a large commanded torque down to the MJCF's jnt_actfrcrange, and
+    the per-joint (lo, hi) cache must be populated at construction
+    time (no mj_name2id calls in the hot PD loop).
+    """
+    # Cache is populated and matches dof_names order.
+    assert iface._actfrc_lo.shape == (29,)
+    assert iface._actfrc_hi.shape == (29,)
+    # G1 MJCF declares actuatorfrcrange on every joint; every entry
+    # should have a finite, non-degenerate range.
+    assert iface._actfrc_has_range.all(), (
+        "expected all 29 G1 joints to have actuatorfrcrange declared; "
+        f"missing: {(~iface._actfrc_has_range).nonzero()[0].tolist()}"
+    )
+    assert (iface._actfrc_hi > iface._actfrc_lo).all()
+
+    # Force a grossly over-range torque command via very high kp +
+    # off-default q target, then step once and verify the actually
+    # written qfrc_applied was clipped at the per-joint range.
+    defaults = np.asarray(G1_CONFIG.default_dof_angles, dtype=np.float64)
+    cmd_q = defaults + 5.0  # ~5 rad error on every joint
+    cmd_dq = np.zeros(29)
+    cmd_tau = np.zeros(29)
+    kp = np.full(29, 10_000.0)  # would produce |tau| >> any declared range
+    kd = np.zeros(29)
+    iface.send_low_command(
+        cmd_q=cmd_q, cmd_dq=cmd_dq, cmd_tau=cmd_tau,
+        kp_override=kp, kd_override=kd,
+    )
+    iface.step(1)
+    # Read back what was written into qfrc_applied at the cached dof indices.
+    written = iface.data.qfrc_applied[iface._dof_qvel_idx]
+    assert np.all(written >= iface._actfrc_lo - 1e-6), (
+        f"some joints below actfrc_lo: diffs="
+        f"{(written - iface._actfrc_lo)[written < iface._actfrc_lo].tolist()}"
+    )
+    assert np.all(written <= iface._actfrc_hi + 1e-6), (
+        f"some joints above actfrc_hi: diffs="
+        f"{(iface._actfrc_hi - written)[written > iface._actfrc_hi].tolist()}"
+    )
+    # Sanity: at least one joint was actually saturated (otherwise the
+    # test isn't exercising the clip path).
+    saturated = np.isclose(written, iface._actfrc_lo) | np.isclose(written, iface._actfrc_hi)
+    assert saturated.any(), (
+        "expected at least one joint to saturate at actfrcrange, but none did; "
+        "test is no longer exercising the clip path"
+    )
+
+
 def test_init_gravity_hold_stays_upright(iface):
     # With gravity on and zero kp/kd (no control), a correctly-initialized
     # robot should not fall catastrophically within a short window. If the

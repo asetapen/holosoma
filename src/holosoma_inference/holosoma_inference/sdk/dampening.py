@@ -129,18 +129,24 @@ class Dampener:
             q_cur = np.asarray(dof_pos_latest, dtype=np.float64).reshape(q.shape)
             q = alpha * q + (1.0 - alpha) * q_cur
 
-        # (2) Hard joint-limit clip.
+        # (2) Hard joint-limit clip. Skip joints that are unlimited (±inf)
+        # — 0.5 * (-inf + +inf) is NaN, and clipping against NaN silently
+        # turns a live target into NaN. In practice every G1 joint has a
+        # range, but guard so a future MJCF without one doesn't trip a
+        # silent failure.
         if (
             knobs.q_limit_scale is not None
             and self._joint_limits_lo is not None
             and self._joint_limits_hi is not None
         ):
             scale = float(knobs.q_limit_scale)
-            mid = 0.5 * (self._joint_limits_lo + self._joint_limits_hi)
-            half = 0.5 * (self._joint_limits_hi - self._joint_limits_lo) * scale
-            lo = mid - half
-            hi = mid + half
-            q = np.clip(q, lo, hi)
+            limited = np.isfinite(self._joint_limits_lo) & np.isfinite(self._joint_limits_hi)
+            if limited.any():
+                lo_fin = self._joint_limits_lo[limited]
+                hi_fin = self._joint_limits_hi[limited]
+                mid = 0.5 * (lo_fin + hi_fin)
+                half = 0.5 * (hi_fin - lo_fin) * scale
+                q[limited] = np.clip(q[limited], mid - half, mid + half)
 
         # (3) Slew clamp against previous post-shim target.
         if knobs.q_slew_per_tick is not None and self._prev_q_out is not None:
