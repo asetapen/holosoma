@@ -311,15 +311,20 @@ class _PicoSkeletonSource:
         self._rclpy = None
 
     def start(self) -> bool:
+        # Narrow to ImportError (walker 2026-05-05 review on
+        # _PicoSkeletonSource): broader Exception would swallow e.g.
+        # bugs inside a transitive dep's import-time side effect. The
+        # expected failure mode here is "ROS deps not installed"; any
+        # other exception is a real problem the operator should see.
         try:
             import rclpy
             from rclpy.node import Node
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
             from rclpy.executors import SingleThreadedExecutor
             from gmp_interfaces.msg import PicoBodyState
-        except Exception as exc:
+        except ImportError as exc:
             print(
-                f"[skeleton] ROS deps not available ({exc!r}) - "
+                f"[skeleton] ROS deps not available ({exc!r}): "
                 "running without skeleton. Launch from the bazel/ROS env to enable.",
                 flush=True,
             )

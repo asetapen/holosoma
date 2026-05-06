@@ -48,6 +48,12 @@ class _InlinePolicyOutputShmWriter:
         joint_size = num_dofs * 8
         self._total_size = self._HEADER_SIZE + 2 * joint_size
 
+        # One WBT policy per shm_name. If two WBT policies start
+        # concurrently with the same name, the second silently unlinks
+        # the first's SHM and the viewer starts seeing a mix of writes
+        # that correspond to neither. Callers that need multi-policy
+        # output should pass distinct shm_name values (e.g. suffixed
+        # with os.getpid()). See walker 2026-05-05 review #13.
         try:
             old = shared_memory.SharedMemory(name=shm_name, create=False)
             old.close()
@@ -555,15 +561,31 @@ class WholeBodyTrackingPolicy(BasePolicy):
         imported until a non-None payload arrives. This keeps
         ``NullTrackingSource`` behavior byte-identical to today.
         """
-        # Initial construction — tried at most once. If it fails, we stay
+        # Initial construction: tried at most once. If it fails, we stay
         # in ONNX-clip mode for the remainder of this policy's lifetime.
+        #
+        # Walker 2026-05-05 review #7: mink's IK solver mutates
+        # self._config.q across frames, and when the MuJoCo interface
+        # backend is also active we end up with two MjModel instances
+        # loaded from the same XML in the same process (interface +
+        # retargeter). This is documented-safe for a single policy but
+        # would silently alias state if a secondary policy shared this
+        # retargeter through _shared_hardware_source. We don't support
+        # that today; the assert below is a tripwire.
         if self._retargeter is None and not self._retargeter_init_failed:
+            if getattr(self, "_shared_hardware_source", False):
+                assert not hasattr(self, "_retargeter_is_shared"), (
+                    "WBT retargeter would be shared across policies via "
+                    "_shared_hardware_source; mink.solve_ik keeps per-frame "
+                    "state in self._config.q which would alias. Not supported."
+                )
+
             urdf_path = getattr(self.config.robot, "urdf_path", None)
             if not urdf_path:
                 self._retargeter_init_failed = True
                 logger.warning(
                     "WBT tracking_source: received payload but robot.urdf_path is unset; "
-                    "cannot construct SMPLRetargeter — falling through to ONNX-clip motion_command."
+                    "cannot construct SMPLRetargeter: falling through to ONNX-clip motion_command."
                 )
                 return None
             try:
@@ -578,7 +600,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self._retargeter_init_failed = True
                 logger.warning(
                     "WBT tracking_source: failed to construct SMPLRetargeter "
-                    f"(urdf_path={urdf_path!r}): {exc!r} — falling through to ONNX-clip motion_command."
+                    f"(urdf_path={urdf_path!r}): {exc!r}: falling through to ONNX-clip motion_command."
                 )
                 return None
 

@@ -187,18 +187,29 @@ def _strip_freejoint(xml_path: str) -> str | None:
     return stripped
 
 
+_ASSET_CACHE: dict[str, dict[str, bytes]] = {}
+
+
 def _asset_dir_for(xml_path: str) -> dict:
     """Return a single-entry asset dict mapping ``assets/<name>`` relative
     paths (the way the shipped MJCFs reference mesh files) to their bytes,
     so ``mujoco.MjModel.from_xml_string`` can find them without an
     on-disk ``meshdir`` resolving relative to cwd.
 
-    Returning the full asset manifest on first load; mujoco caches the
-    parsed model after that.
+    Walker 2026-05-05 review #15: cache the manifest keyed on xml_path
+    so repeated SMPLRetargeter construction (e.g. WBT policy re-init)
+    doesn't re-read every OBJ/STL from disk every time. mujoco does not
+    cache from_xml_string assets across calls, so without this every
+    retargeter instance paid ~60 file reads before first retarget().
     """
     import os as _os
 
     base = _os.path.dirname(_os.path.abspath(xml_path))
+    cache_key = _os.path.abspath(xml_path)
+    cached = _ASSET_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     assets: dict[str, bytes] = {}
     for root, _dirs, files in _os.walk(base):
         for fn in files:
@@ -208,6 +219,7 @@ def _asset_dir_for(xml_path: str) -> dict:
             rel = _os.path.relpath(p, base)
             with open(p, "rb") as f:
                 assets[rel] = f.read()
+    _ASSET_CACHE[cache_key] = assets
     return assets
 
 
@@ -358,9 +370,22 @@ class SMPLRetargeter:
         import os as _os
 
         tol = float(_os.environ.get("HOLOSOMA_RETARGETER_IK_TOL", "1e-4") or 1e-4)
+        # dt=0.1 is a pseudo-time for the damped-least-squares iteration.
+        # It is intentionally decoupled from self._dt (the caller's control
+        # rate, used only for finite-difference dq output). solve_ik +
+        # integrate_inplace use this value as the integration horizon for
+        # the DLS update; 0.1 has been tuned for convergence behavior and
+        # is unrelated to the 50 Hz teleop tick. If this is ever threaded
+        # through from self._dt, verify the finite-difference dq path in
+        # retarget() still produces sane velocities.
+        # See walker 2026-05-05 review #4.
+        _IK_PSEUDO_DT = 0.1
         for _ in range(self._max_ik_iters):
-            vel = mink.solve_ik(self._config, tasks, dt=0.1, solver="daqp", damping=1e-4, limits=limits)
-            self._config.integrate_inplace(vel, 0.1)
+            vel = mink.solve_ik(
+                self._config, tasks, dt=_IK_PSEUDO_DT,
+                solver="daqp", damping=1e-4, limits=limits,
+            )
+            self._config.integrate_inplace(vel, _IK_PSEUDO_DT)
             if np.linalg.norm(vel) < tol:
                 break
 

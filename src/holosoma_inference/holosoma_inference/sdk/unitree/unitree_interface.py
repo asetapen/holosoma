@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from loguru import logger
 
 from holosoma_inference.config.config_types import RobotConfig
 from holosoma_inference.sdk.base.base_interface import BaseInterface
@@ -113,18 +114,19 @@ class UnitreeInterface(BaseInterface):
         ros_domain_id = _os.environ.get("ROS_DOMAIN_ID", "<unset>")
         # The Python binding's create_robot() does NOT accept a domain_id;
         # the C++ side hardcodes 0. Log the Python-side arg so callers can
-        # see the divergence.
-        print(
-            f"[unitree_interface] pid={_os.getpid()} ppid={_os.getppid()} "
-            f"iface={self.interface_str} "
-            f"python_domain_id_arg={self.domain_id} "
-            f"C++_domain_id=0 (hardcoded) "
-            f"ROS_DOMAIN_ID={ros_domain_id} "
-            f"CYCLONEDDS_DOMAIN={cyclonedds_domain} "
-            f"CYCLONEDDS_URI_set={cyclonedds_uri != '<unset>'}",
-            file=_sys.stderr,
-            flush=True,
-        )
+        # see the divergence. Gated on HOLOSOMA_DDS_DIAG (default on) so
+        # callers can silence the two participant-diagnostic lines without
+        # losing the rest of the boot log.
+        _dds_diag = _os.environ.get("HOLOSOMA_DDS_DIAG", "1") not in ("0", "false", "False", "")
+        if _dds_diag:
+            logger.info(
+                "[unitree_interface] pid={} ppid={} iface={} "
+                "python_domain_id_arg={} C++_domain_id=0 (hardcoded) "
+                "ROS_DOMAIN_ID={} CYCLONEDDS_DOMAIN={} CYCLONEDDS_URI_set={}",
+                _os.getpid(), _os.getppid(), self.interface_str,
+                self.domain_id, ros_domain_id, cyclonedds_domain,
+                cyclonedds_uri != "<unset>",
+            )
 
         self.unitree_interface = unitree_interface.create_robot(
             self.interface_str,
@@ -133,11 +135,11 @@ class UnitreeInterface(BaseInterface):
         )
         self.unitree_interface.set_control_mode(unitree_interface.ControlMode.PR)
 
-        print(
-            f"[unitree_interface] pid={_os.getpid()} create_robot + set_control_mode(PR) complete",
-            file=_sys.stderr,
-            flush=True,
-        )
+        if _dds_diag:
+            logger.info(
+                "[unitree_interface] pid={} create_robot + set_control_mode(PR) complete",
+                _os.getpid(),
+            )
 
         # GO2 SDK motor order differs from joint order
         if self.robot_config.robot.lower() == "go2":

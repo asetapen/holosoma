@@ -13,7 +13,7 @@ converged reference). If delta < a few degrees, iters=1 is safe.
 
 Usage:
     bazel run //...:bench_retargeter_quality -- \\
-        --mcap /home/devuser/far_pi/holosoma_extensions/test_data/pico_example_long.mcap \\
+        --mcap $HOLOSOMA_TEST_DATA/pico_example_long.mcap \\
         --max-frames 1500
 """
 

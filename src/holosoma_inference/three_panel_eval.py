@@ -258,11 +258,14 @@ def _load_holosoma_cmd_bag(bag_path: Path):
             for _, _, msg in reader.iter_messages(topics=["/holosoma_cmd"]):
                 try:
                     stamp_ns, _names, pos, _v, _a = _decode_joint_trajectory_cdr(msg.data)
-                except Exception as exc:
+                except (struct.error, UnicodeDecodeError, ValueError, EOFError) as exc:
                     # Bags sometimes have a malformed first/last message;
-                    # skip rather than fail the whole run — but count
+                    # skip rather than fail the whole run, but count
                     # failures and surface the first one so a schema
                     # change doesn't silently drop every frame.
+                    # Narrow exception type: we want KeyboardInterrupt /
+                    # MemoryError / SystemExit to still propagate.
+                    # See walker 2026-05-05 review #14.
                     n_decode_errors += 1
                     if first_decode_err is None:
                         first_decode_err = exc
@@ -409,6 +412,9 @@ def _build_g1_scene() -> G1Scene:
                    n_dof=29, default_q=default_q)
 
 
+_render_g1_pose_warned_dof_mismatch = False
+
+
 def _render_g1_pose(scene: G1Scene, q_joints, label: str,
                     root_pos=None, root_quat_wxyz=None) -> "np.ndarray":
     """Set qpos[7:36] = q_joints and (optionally) freejoint pose, mj_forward, render.
@@ -426,11 +432,12 @@ def _render_g1_pose(scene: G1Scene, q_joints, label: str,
         # Pad/truncate defensively so a bad input doesn't crash the whole
         # video, but warn the first time so a configuration drift (e.g.
         # a 25-DOF checkpoint feeding a 29-DOF scene) isn't silent.
-        if not getattr(_render_g1_pose, "_warned_dof_mismatch", False):
+        global _render_g1_pose_warned_dof_mismatch
+        if not _render_g1_pose_warned_dof_mismatch:
             print(f"  warning: q_joints has {q.shape[0]} DOF, scene expects "
-                  f"{scene.n_dof} — padding/truncating (further warnings suppressed).",
+                  f"{scene.n_dof}: padding/truncating (further warnings suppressed).",
                   file=sys.stderr)
-            _render_g1_pose._warned_dof_mismatch = True
+            _render_g1_pose_warned_dof_mismatch = True
         fixed = np.zeros(scene.n_dof)
         fixed[: min(scene.n_dof, q.shape[0])] = q[: min(scene.n_dof, q.shape[0])]
         q = fixed

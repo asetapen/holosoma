@@ -21,7 +21,7 @@ retarget-vs-sim MuJoCo contention.
 
 Usage (inside bazel hermetic env):
     bazel run //...:bench_pipeline -- \\
-        --mcap /home/devuser/far_pi/holosoma_extensions/test_data/pico_example_long.mcap \\
+        --mcap $HOLOSOMA_TEST_DATA/pico_example_long.mcap \\
         --iters 300
 
     # Isolate the retargeter (no concurrent sim tick)
