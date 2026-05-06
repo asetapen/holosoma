@@ -129,8 +129,8 @@ class Dampener:
             q_cur = np.asarray(dof_pos_latest, dtype=np.float64).reshape(q.shape)
             q = alpha * q + (1.0 - alpha) * q_cur
 
-        # (2) Hard joint-limit clip. Skip joints that are unlimited (±inf)
-        # — 0.5 * (-inf + +inf) is NaN, and clipping against NaN silently
+        # (2) Hard joint-limit clip. Skip joints that are unlimited (+/-inf):
+        # 0.5 * (-inf + +inf) is NaN, and clipping against NaN silently
         # turns a live target into NaN. In practice every G1 joint has a
         # range, but guard so a future MJCF without one doesn't trip a
         # silent failure.

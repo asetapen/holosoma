@@ -145,7 +145,7 @@ class MujocoInterface(BaseInterface):
         # we store (-inf, +inf) and skip clipping in _apply_pd_torque.
         #
         # This distinguishes "no range declared" from "range is exactly
-        # (0, 0)" — under the prior hi > lo check the latter silently
+        # (0, 0)": under the prior hi > lo check the latter silently
         # no-op'd, which is indistinguishable from the former and would
         # mask a corrupt-MJCF situation.
         actfrc_lo = np.full(robot_config.num_joints, -np.inf)

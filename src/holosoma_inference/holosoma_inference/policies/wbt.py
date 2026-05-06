@@ -495,7 +495,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._retargeter_runtime_err_count += 1
         if not self._retargeter_runtime_warned:
             logger.warning(
-                "WBT tracking_source: {} — falling through to ONNX-clip "
+                "WBT tracking_source: {}: falling through to ONNX-clip "
                 "motion_command. Subsequent failures suppressed; a periodic "
                 "re-WARN will fire every {} frames.",
                 reason,
@@ -509,7 +509,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         )
         if delta >= self._retargeter_runtime_rewarn_every:
             logger.warning(
-                "WBT tracking_source: retargeter still failing — "
+                "WBT tracking_source: retargeter still failing. "
                 "{} total fallthroughs so far (last reason: {}).",
                 self._retargeter_runtime_err_count,
                 reason,
