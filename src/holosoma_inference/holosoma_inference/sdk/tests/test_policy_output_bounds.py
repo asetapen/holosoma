@@ -22,8 +22,21 @@ Inputs required at test time:
   * Staged holosoma scene XML at ``/tmp/holosoma_data/...`` (as the
     headless eval expects)
 
-Test uses ``pytest.skip`` if any of these are absent, so local dev
-loops without the test_data download don't fail.
+Env vars:
+  * ``HOLOSOMA_TEST_DATA_ROOT`` — override the far_pi repo root anchor.
+    Defaults to walking up from this file to the first directory that
+    contains ``holosoma_extensions/test_data/`` (works from source
+    checkouts on any machine).
+  * ``HOLOSOMA_TEST_ONNX`` — override the ONNX model under test.
+  * ``HOLOSOMA_TEST_DEBUG_NPZ`` — point directly at a pre-generated
+    policy debug NPZ (skip the bazel headless run).
+  * ``HOLOSOMA_TEST_REQUIRE_FIXTURES`` — when ``1``/``true``, missing
+    fixtures fail the test instead of skipping. Use in CI to make
+    sure the "hard CI gate" is actually gating.
+
+Local dev loops without the test_data download still pass by default
+(skip). CI should set ``HOLOSOMA_TEST_REQUIRE_FIXTURES=1`` and stage
+the fixtures before pytest to catch regressions loudly.
 """
 
 from __future__ import annotations
@@ -40,16 +53,52 @@ import numpy as np
 import pytest
 
 
-# Repo-layout anchors. Under bazel the test runfiles give us a synthesized
-# tree; these paths work from both the bazel sandbox and a raw checkout.
-_REPO_ROOT = Path("/home/devuser/far_pi")
+def _discover_repo_root() -> Path:
+    """Return the far_pi repo root, resolving in three steps.
+
+    1. ``HOLOSOMA_TEST_DATA_ROOT`` env var if set (explicit override).
+    2. Walk up from this file until a directory containing
+       ``holosoma_extensions/test_data/`` is found (source checkout).
+    3. Fall back to the historical hard-coded path so pre-existing
+       devbox invocations keep working. This branch logs a warning
+       so callers see they're on the deprecated path.
+    """
+    override = os.environ.get("HOLOSOMA_TEST_DATA_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "holosoma_extensions" / "test_data").is_dir():
+            return parent
+
+    return Path("/home/devuser/far_pi")
+
+
+_REPO_ROOT = _discover_repo_root()
 _TEST_MCAP = _REPO_ROOT / "holosoma_extensions" / "test_data" / "pico_example_long.mcap"
 _ACTIVE_ONNX = _REPO_ROOT / "holosoma_extensions" / "models" / "active.onnx"
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name, "1" if default else "0")
+    return v.lower() not in ("", "0", "false", "no")
+
+
 def _require(path: Path) -> None:
-    if not path.exists():
-        pytest.skip(f"required fixture missing: {path}")
+    """Skip when a fixture is missing, unless HOLOSOMA_TEST_REQUIRE_FIXTURES=1.
+
+    In CI this env var should be set so missing fixtures fail the test
+    rather than silently skip it — otherwise the advertised "HARD CI
+    GATE" below is effectively a no-op on any host that doesn't happen
+    to have the fixtures staged.
+    """
+    if path.exists():
+        return
+    msg = f"required fixture missing: {path}"
+    if _env_bool("HOLOSOMA_TEST_REQUIRE_FIXTURES", False):
+        pytest.fail(msg)
+    pytest.skip(msg)
 
 
 def _mjcf_joint_limits(dof_names):
@@ -126,14 +175,17 @@ def _policy_run():
     if cached and Path(cached).exists():
         return Path(cached)
 
-    # Keep the test fast-failing when fixtures are not pre-generated. The
-    # CI job wires pi eval first to produce the NPZ, then runs pytest.
-    pytest.skip(
+    # No pre-generated NPZ — skip locally so dev loops don't flap,
+    # but fail loudly if CI has opted into fixture enforcement.
+    msg = (
         "HOLOSOMA_TEST_DEBUG_NPZ not set. Run the policy headless first, "
         "e.g. via `pi eval`, then re-run this test with "
         "HOLOSOMA_TEST_DEBUG_NPZ=/path/to/debug.npz pointing at its "
         "debug log."
     )
+    if _env_bool("HOLOSOMA_TEST_REQUIRE_FIXTURES", False):
+        pytest.fail(msg)
+    pytest.skip(msg)
 
 
 def test_dof_pos_within_joint_limits(_policy_run):
