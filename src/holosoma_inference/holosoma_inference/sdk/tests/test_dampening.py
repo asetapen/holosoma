@@ -107,7 +107,7 @@ def test_blend_alpha_half_is_midpoint(monkeypatch):
 
 
 def test_policy_base_reset_hook_calls_dampener_reset():
-    """Walker review #8: base policy start/stop/init transitions must
+    """Code review #8: base policy start/stop/init transitions must
     call Dampener.reset() so the slew memory doesn't leak across
     control regimes.
 
@@ -157,7 +157,7 @@ def test_reset_clears_slew_memory(monkeypatch):
 
 
 def test_q_limit_clip_skips_unlimited_joints(monkeypatch):
-    """Walker review #9: a joint with ±inf bounds must be left alone
+    """Code review #9: a joint with ±inf bounds must be left alone
     instead of clipped against NaN (which (lo+hi)/2 silently produces).
 
     Mixed limited/unlimited: joint 0 is limited to [-1, 1], joint 1 is

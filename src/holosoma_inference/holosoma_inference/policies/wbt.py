@@ -53,7 +53,7 @@ class _InlinePolicyOutputShmWriter:
         # the first's SHM and the viewer starts seeing a mix of writes
         # that correspond to neither. Callers that need multi-policy
         # output should pass distinct shm_name values (e.g. suffixed
-        # with os.getpid()). See walker 2026-05-05 review #13.
+        # with os.getpid()). See 2026-05-05 code review #13.
         try:
             old = shared_memory.SharedMemory(name=shm_name, create=False)
             old.close()
@@ -103,7 +103,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._retargeter = None  # type: ignore[var-annotated]
         self._retargeter_init_failed = False
         self._retargeter_runtime_warned = False
-        # Walker 2026-05-05 finding #6: track how many frames have fallen
+        # 2026-05-05 code review #6: track how many frames have fallen
         # through after the first WARN, and re-warn periodically so an
         # operator who misses the one-shot log line still sees that the
         # retargeter is no-op'ing (the 2026-05-02 analysis found a 30-
@@ -433,7 +433,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 # motion_ref_ori_b in the obs stays anchored at the ONNX
                 # clip's baseline pose while joint targets come from live
                 # teleop, which caused the on-robot T-pose under-reach on
-                # 2026-05-05 (walker review finding #5). None means the
+                # 2026-05-05 (code review finding #5). None means the
                 # retargeter returned an invalid root quat; hold the last
                 # value rather than feed NaN into the obs.
                 if retargeted_ref_quat_xyzw is not None:
@@ -529,7 +529,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         Called on policy stop/start transitions so a transient tracker
         glitch at the start of a session doesn't silence every future
-        failure in the process lifetime (walker 2026-05-05 #6).
+        failure in the process lifetime (2026-05-05 code review #6).
         """
         self._retargeter_runtime_warned = False
         self._retargeter_runtime_err_count = 0
@@ -564,7 +564,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # Initial construction: tried at most once. If it fails, we stay
         # in ONNX-clip mode for the remainder of this policy's lifetime.
         #
-        # Walker 2026-05-05 review #7: mink's IK solver mutates
+        # 2026-05-05 code review #7: mink's IK solver mutates
         # self._config.q across frames, and when the MuJoCo interface
         # backend is also active we end up with two MjModel instances
         # loaded from the same XML in the same process (interface +
@@ -731,7 +731,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._stiff_hold_active = False
         self._capture_robot_yaw_offset()
         self._capture_motion_yaw_offset(self.ref_quat_xyzw_0)
-        # Walker 2026-05-05 #6: clear the retargeter one-shot WARN latch
+        # 2026-05-05 code review #6: clear the retargeter one-shot WARN latch
         # so a transient tracker glitch at the start of a session doesn't
         # silence every future failure in the process lifetime.
         self._reset_retargeter_runtime_state()
@@ -770,7 +770,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_command_t = self.motion_command_0.copy()
         self.robot_yaw_offset = 0.0
         self.motion_yaw_offset = 0.0
-        # Walker 2026-05-05 #6: clear retargeter WARN latch on stop so a
+        # 2026-05-05 code review #6: clear retargeter WARN latch on stop so a
         # restart of the policy doesn't stay silent across transient faults.
         self._reset_retargeter_runtime_state()
 

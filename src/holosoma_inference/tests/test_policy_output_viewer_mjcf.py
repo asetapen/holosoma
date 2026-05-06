@@ -1,6 +1,6 @@
 """Tests for policy_output_viewer._build_dual_g1_mjcf.
 
-Walker 2026-05-05 code-review blocker #2: verify that the assembled
+2026-05-05 code review blocker #2: verify that the assembled
 dual-G1 MJCF actually loads in MuJoCo and that both copies retain
 mesh geometry. Catches regressions where a rename pass silently breaks
 mesh="..." refs in one of the copies.

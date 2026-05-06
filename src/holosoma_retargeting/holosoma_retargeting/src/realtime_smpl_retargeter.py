@@ -196,7 +196,7 @@ def _asset_dir_for(xml_path: str) -> dict:
     so ``mujoco.MjModel.from_xml_string`` can find them without an
     on-disk ``meshdir`` resolving relative to cwd.
 
-    Walker 2026-05-05 review #15: cache the manifest keyed on xml_path
+    2026-05-05 code review #15: cache the manifest keyed on xml_path
     so repeated SMPLRetargeter construction (e.g. WBT policy re-init)
     doesn't re-read every OBJ/STL from disk every time. mujoco does not
     cache from_xml_string assets across calls, so without this every
@@ -378,7 +378,7 @@ class SMPLRetargeter:
         # is unrelated to the 50 Hz teleop tick. If this is ever threaded
         # through from self._dt, verify the finite-difference dq path in
         # retarget() still produces sane velocities.
-        # See walker 2026-05-05 review #4.
+        # See 2026-05-05 code review #4.
         _IK_PSEUDO_DT = 0.1
         for _ in range(self._max_ik_iters):
             vel = mink.solve_ik(

@@ -180,7 +180,7 @@ def test_init_pelvis_freejoint_placed_feet_on_floor(iface):
 
 
 def test_actfrcrange_clip_and_cache(iface):
-    """Walker review blocker #3: actuator-force saturation must clip
+    """Code review #3: actuator-force saturation must clip
     a large commanded torque down to the MJCF's jnt_actfrcrange, and
     the per-joint (lo, hi) cache must be populated at construction
     time (no mj_name2id calls in the hot PD loop).

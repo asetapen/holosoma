@@ -88,6 +88,9 @@ def _bare_policy(tracking_source) -> WholeBodyTrackingPolicy:
     policy._retargeter = None
     policy._retargeter_init_failed = False
     policy._retargeter_runtime_warned = False
+    policy._retargeter_runtime_err_count = 0
+    policy._retargeter_runtime_last_warn_count = 0
+    policy._retargeter_runtime_rewarn_every = 500
     policy.num_dofs = 29
     policy.config = SimpleNamespace(
         robot=SimpleNamespace(urdf_path="/tmp/fake-g1.xml"),
@@ -285,7 +288,7 @@ class TestRlInferenceBranching:
 
     def test_custom_source_substitutes_ref_quat_xyzw_t(self) -> None:
         """Regression: live teleop must also replace the reference orientation,
-        not just the joint targets. Walker review finding #5 (2026-05-05):
+        not just the joint targets. Code review #5 (2026-05-05):
         leaving ref_quat_xyzw_t at the ONNX-clip baseline while joint targets
         track live teleop caused arm commands to under-reach on-robot."""
         payload = _make_payload()

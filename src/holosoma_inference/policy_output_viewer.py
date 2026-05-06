@@ -311,7 +311,7 @@ class _PicoSkeletonSource:
         self._rclpy = None
 
     def start(self) -> bool:
-        # Narrow to ImportError (walker 2026-05-05 review on
+        # Narrow to ImportError (2026-05-05 code review on
         # _PicoSkeletonSource): broader Exception would swallow e.g.
         # bugs inside a transitive dep's import-time side effect. The
         # expected failure mode here is "ROS deps not installed"; any

@@ -820,7 +820,7 @@ class BasePolicy:
         the reverse when a fallback resumes stiff-hold) the previous
         output reflects a different control regime; keeping it would
         throttle the first frames of the new regime in ways the operator
-        didn't ask for. See walker 2026-05-05 finding #8.
+        didn't ask for. See 2026-05-05 code review #8.
         """
         d = getattr(self.interface, "_dampener", None)
         if d is not None:

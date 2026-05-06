@@ -265,7 +265,7 @@ def _load_holosoma_cmd_bag(bag_path: Path):
                     # change doesn't silently drop every frame.
                     # Narrow exception type: we want KeyboardInterrupt /
                     # MemoryError / SystemExit to still propagate.
-                    # See walker 2026-05-05 review #14.
+                    # See 2026-05-05 code review #14.
                     n_decode_errors += 1
                     if first_decode_err is None:
                         first_decode_err = exc
@@ -751,7 +751,7 @@ def main() -> int:
 
         # The policy's start() path wires ``use_policy_action = True`` only
         # after a StateCommand.START. Call the same helper the driver's
-        # autostart does. Hard fail on failure (walker 2026-05-05 review
+        # autostart does. Hard fail on failure (2026-05-05 code review
         # #10): three_panel_eval is a diagnostic harness whose entire point
         # is comparing panel-3 policy output to panels 1/2. Silently
         # swallowing the START dispatch and running with

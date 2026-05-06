@@ -23,7 +23,7 @@ Inputs required at test time:
     headless eval expects)
 
 Env vars:
-  * ``HOLOSOMA_TEST_DATA_ROOT`` — override the far_pi repo root anchor.
+  * ``HOLOSOMA_TEST_DATA_ROOT`` — override the embedding-tree root anchor.
     Defaults to walking up from this file to the first directory that
     contains ``holosoma_extensions/test_data/`` (works from source
     checkouts on any machine).
@@ -54,14 +54,15 @@ import pytest
 
 
 def _discover_repo_root() -> Path:
-    """Return the far_pi repo root, resolving in three steps.
+    """Return the embedding-tree root (the dir that contains
+    ``holosoma_extensions/test_data/``), resolving in three steps:
 
     1. ``HOLOSOMA_TEST_DATA_ROOT`` env var if set (explicit override).
     2. Walk up from this file until a directory containing
        ``holosoma_extensions/test_data/`` is found (source checkout).
-    3. Fall back to the historical hard-coded path so pre-existing
-       devbox invocations keep working. This branch logs a warning
-       so callers see they're on the deprecated path.
+    3. Fall back to a no-op sentinel path so _require() produces a
+       clean "required fixture missing" message instead of masking
+       the discovery failure.
     """
     override = os.environ.get("HOLOSOMA_TEST_DATA_ROOT")
     if override:
@@ -72,7 +73,7 @@ def _discover_repo_root() -> Path:
         if (parent / "holosoma_extensions" / "test_data").is_dir():
             return parent
 
-    return Path("/home/devuser/far_pi")
+    return Path("/nonexistent/holosoma_test_data_root_unset")
 
 
 _REPO_ROOT = _discover_repo_root()
