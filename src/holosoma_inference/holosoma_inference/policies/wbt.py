@@ -11,7 +11,14 @@ from termcolor import colored
 
 from holosoma_inference.config.config_types.inference import InferenceConfig
 from holosoma_inference.policies import BasePolicy
-from holosoma_inference.policies.tracking_source import NullTrackingSource, TrackingSource
+from holosoma_inference.policies.motion_command_source import (
+    ClipMotionCommandSource,
+    MotionCommandSource,
+)
+from holosoma_inference.policies.policy_output import (
+    NullPolicyOutputObserver,
+    PolicyOutputObserver,
+)
 from holosoma_inference.policies.wbt_utils import MotionClockUtil, PinocchioRobot, TimestepUtil
 from holosoma_inference.utils.clock import ClockSub
 from holosoma_inference.utils.math.quat import (
@@ -26,92 +33,28 @@ from holosoma_inference.utils.math.quat import (
 )
 
 
-class _InlinePolicyOutputShmWriter:
-    """Inlined writer for the `holosoma_policy_output` SHM segment.
-
-    Mirrors holosoma_ext_viser.skeleton_shm.PolicyOutputShmWriter byte-for-
-    byte. Inlined here so the bazel-built inference binary publishes the
-    (q_target, dof_pos) stream without a dep on holosoma_ext_viser, which
-    is pip-only. Layout must stay in sync with _PolicyOutputShmReader in
-    policy_output_viewer.py.
-    """
-
-    _HEADER_SIZE = 8
-
-    def __init__(self, num_dofs: int = 29, shm_name: str = "holosoma_policy_output") -> None:
-        import struct as _struct
-        from multiprocessing import shared_memory
-
-        self._struct = _struct
-        self._shm_name = shm_name
-        self._num_dofs = num_dofs
-        joint_size = num_dofs * 8
-        self._total_size = self._HEADER_SIZE + 2 * joint_size
-
-        # One WBT policy per shm_name. If two WBT policies start
-        # concurrently with the same name, the second silently unlinks
-        # the first's SHM and the viewer starts seeing a mix of writes
-        # that correspond to neither. Callers that need multi-policy
-        # output should pass distinct shm_name values (e.g. suffixed
-        # with os.getpid()). See 2026-05-05 code review #13.
-        try:
-            old = shared_memory.SharedMemory(name=shm_name, create=False)
-            old.close()
-            old.unlink()
-        except FileNotFoundError:
-            pass
-
-        self._shm = shared_memory.SharedMemory(name=shm_name, create=True, size=self._total_size)
-        off = self._HEADER_SIZE
-        self._q_target = np.ndarray((num_dofs,), dtype=np.float64, buffer=self._shm.buf[off : off + joint_size])
-        off += joint_size
-        self._dof_pos = np.ndarray((num_dofs,), dtype=np.float64, buffer=self._shm.buf[off : off + joint_size])
-        self._q_target[:] = 0.0
-        self._dof_pos[:] = 0.0
-
-    def write(self, q_target: np.ndarray, dof_pos: np.ndarray) -> None:
-        import time as _time
-
-        self._q_target[:] = q_target
-        self._dof_pos[:] = dof_pos
-        self._struct.pack_into("d", self._shm.buf, 0, _time.monotonic())
-
-    def close(self) -> None:
-        try:
-            self._shm.close()
-        except Exception as exc:
-            logger.debug("SHM close failed: {}", exc)
-        try:
-            self._shm.unlink()
-        except Exception as exc:
-            logger.debug("SHM unlink failed: {}", exc)
-
-
 class WholeBodyTrackingPolicy(BasePolicy):
-    def __init__(self, config: InferenceConfig, tracking_source: TrackingSource | None = None):
+    def __init__(
+        self,
+        config: InferenceConfig,
+        motion_command_source: MotionCommandSource | None = None,
+        policy_output_observer: PolicyOutputObserver | None = None,
+    ):
         self.config = config
-        # Transport-agnostic external tracking input. Default ``NullTrackingSource``
-        # makes this an exact no-op — behavior is byte-identical to the
-        # pre-change policy unless a concrete source is injected at construction.
-        # See ``holosoma_inference.policies.tracking_source`` for the contract.
-        self._tracking_source: TrackingSource = tracking_source or NullTrackingSource()
-
-        # Lazy retargeter state. Populated on first non-None payload so that
-        # mink/mujoco are NOT imported at policy construction when no tracking
-        # source is in play — keeps NullTrackingSource byte-identical to the
-        # pre-change policy (no new dependency load path).
-        self._retargeter = None  # type: ignore[var-annotated]
-        self._retargeter_init_failed = False
-        self._retargeter_runtime_warned = False
-        # 2026-05-05 code review #6: track how many frames have fallen
-        # through after the first WARN, and re-warn periodically so an
-        # operator who misses the one-shot log line still sees that the
-        # retargeter is no-op'ing (the 2026-05-02 analysis found a 30-
-        # minute silent retargeter OOM this would have caught).
-        self._retargeter_runtime_err_count = 0
-        self._retargeter_runtime_last_warn_count = 0
-        # Re-WARN every ~500 frames (= ~10 s at 50 Hz).
-        self._retargeter_runtime_rewarn_every = 500
+        # Per-tick motion-command provider. Default ``ClipMotionCommandSource``
+        # is a no-op; the ONNX-clip motion command drives behavior. To inject
+        # external tracking, pass a ``RetargetedTrackingMotionCommandSource``
+        # (or a custom implementation of ``MotionCommandSource``). See
+        # ``holosoma_inference.policies.motion_command_source``.
+        self._motion_command_source: MotionCommandSource = (
+            motion_command_source or ClipMotionCommandSource()
+        )
+        # Observer for per-tick (q_target, dof_pos) output. Default no-op.
+        # Extensions wire in their own transport (SHM, sockets, ...). See
+        # ``holosoma_inference.policies.policy_output``.
+        self._policy_output_observer: PolicyOutputObserver = (
+            policy_output_observer or NullPolicyOutputObserver()
+        )
 
         # initialize motion state
         self.motion_clip_progressing = False
@@ -260,27 +203,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         self.policy = policy_act
 
-        # Shared-memory publisher for the side-by-side policy_output_viewer.
-        # Best-effort — the policy runs unchanged if shm creation fails.
-        self._policy_shm_writer = None
-        try:
-            self._policy_shm_writer = _InlinePolicyOutputShmWriter(num_dofs=self.num_dofs)
-            import atexit as _atexit
-
-            _atexit.register(self._cleanup_policy_shm)
-            logger.info("Policy-output shared memory publisher started (holosoma_policy_output)")
-        except Exception as e:
-            logger.warning("Failed to start policy-output shared memory writer: {}", e)
-
-    def _cleanup_policy_shm(self):
-        w = getattr(self, "_policy_shm_writer", None)
-        if w is not None:
-            try:
-                w.close()
-            except Exception as exc:
-                logger.debug("policy-output SHM close failed: {}", exc)
-            self._policy_shm_writer = None
-
     def _capture_policy_state(self):
         state = super()._capture_policy_state()
         state.update(
@@ -402,40 +324,26 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # URDF), we log once and fall through to the ONNX-clip path —
         # the driver's sticky-fault contract expects the policy to keep
         # producing commands under partial sensor failures.
-        external = self._tracking_source.get_latest()
+        urdf_path = getattr(self.config.robot, "urdf_path", None)
+        substituted = self._motion_command_source.poll(
+            num_dofs=self.num_dofs,
+            rl_rate_hz=float(self.config.task.rl_rate),
+            urdf_path=urdf_path,
+        )
+        if substituted is not None:
+            new_motion_command, new_ref_quat_xyzw = substituted
+            self.motion_command_t = new_motion_command
+            # Also substitute the reference orientation. Without this,
+            # motion_ref_ori_b in the obs stays anchored at the ONNX
+            # clip's baseline pose while joint targets come from live
+            # teleop, which caused the on-robot T-pose under-reach on
+            # 2026-05-05 (code review finding #5). None means the source
+            # could not produce a valid root quat; keep the last value
+            # rather than feed NaN into the obs.
+            if new_ref_quat_xyzw is not None:
+                self.ref_quat_xyzw_t = new_ref_quat_xyzw
         if _dbg:
-            _ts.append(("tracking_poll", _time.perf_counter()))
-        if external is not None:
-            # Payload log was firing on every inference tick (50-100 Hz),
-            # drowning legitimate WARN/ERROR in DEBUG mode. Throttle to
-            # one line per 200 payloads so a pathological source (quality
-            # flipping, device swap) still shows up without the volume.
-            if not hasattr(self, "_external_log_counter"):
-                self._external_log_counter = 0
-            self._external_log_counter += 1
-            if self._external_log_counter % 200 == 1:
-                logger.debug(
-                    f"WBT tracking_source: payload #{self._external_log_counter} "
-                    f"device={external.device_type!r} mode={external.mode} "
-                    f"body_joints={len(external.joint_names)} "
-                    f"hand_joints={len(external.hand_joint_names)} "
-                    f"quality={external.tracking_quality}"
-                )
-            retargeted = self._retarget_payload_to_motion_command(external)
-            if retargeted is not None:
-                retargeted_motion_command, retargeted_ref_quat_xyzw = retargeted
-                self.motion_command_t = retargeted_motion_command
-                # Also substitute the reference orientation. Without this,
-                # motion_ref_ori_b in the obs stays anchored at the ONNX
-                # clip's baseline pose while joint targets come from live
-                # teleop, which caused the on-robot T-pose under-reach on
-                # 2026-05-05 (code review finding #5). None means the
-                # retargeter returned an invalid root quat; hold the last
-                # value rather than feed NaN into the obs.
-                if retargeted_ref_quat_xyzw is not None:
-                    self.ref_quat_xyzw_t = retargeted_ref_quat_xyzw
-        if _dbg:
-            _ts.append(("retarget", _time.perf_counter()))
+            _ts.append(("motion_command_source", _time.perf_counter()))
 
         if not self.motion_clip_progressing:
             # Keep motion index pinned at the configured start while waiting to trigger the clip.
@@ -463,17 +371,17 @@ class WholeBodyTrackingPolicy(BasePolicy):
         else:
             self.scaled_policy_action = policy_action * self.per_joint_policy_action_scale
 
-        # Publish (q_target, dof_pos) to shared memory for policy_output_viewer.
+        # Publish (q_target, dof_pos) to the injected observer.
         # q_target is the commanded set-point pre-Dampener; dof_pos is the
         # robot readback. Both in the policy's joint order (matches the ONNX
-        # dof_names). Best-effort; shape mismatches bail silently.
-        if getattr(self, "_policy_shm_writer", None) is not None:
-            try:
-                q_target_pub = (self.scaled_policy_action + self.default_dof_angles).reshape(-1).astype(np.float64)
-                dof_pos_pub = robot_state_data[0, 7 : 7 + self.num_dofs].astype(np.float64)
-                self._policy_shm_writer.write(q_target_pub, dof_pos_pub)
-            except Exception as _e:
-                logger.debug("policy-output shm write failed: {}", _e)
+        # dof_names). Best-effort; observer exceptions must not bring down
+        # the control loop.
+        try:
+            q_target_pub = (self.scaled_policy_action + self.default_dof_angles).reshape(-1).astype(np.float64)
+            dof_pos_pub = robot_state_data[0, 7 : 7 + self.num_dofs].astype(np.float64)
+            self._policy_output_observer.on_tick(q_target_pub, dof_pos_pub)
+        except Exception as _e:
+            logger.debug("policy-output observer on_tick failed: {}", _e)
 
         # update motion timestep
         self._set_motion_timestep()
@@ -485,163 +393,6 @@ class WholeBodyTrackingPolicy(BasePolicy):
             logger.info("[inference_timing] " + " ".join(parts))
 
         return self.scaled_policy_action
-
-    def _retargeter_warn(self, reason: str) -> None:
-        """Log a retargeter-fallthrough WARN once, then throttled re-WARNs.
-
-        First call prints the reason + intent to suppress. Every
-        `_retargeter_runtime_rewarn_every` calls after that, we log
-        again with the accumulated count so silent-failure stretches
-        are visible in logs.
-        """
-        self._retargeter_runtime_err_count += 1
-        if not self._retargeter_runtime_warned:
-            logger.warning(
-                "WBT tracking_source: {}: falling through to ONNX-clip "
-                "motion_command. Subsequent failures suppressed; a periodic "
-                "re-WARN will fire every {} frames.",
-                reason,
-                self._retargeter_runtime_rewarn_every,
-            )
-            self._retargeter_runtime_warned = True
-            self._retargeter_runtime_last_warn_count = 1
-            return
-        delta = self._retargeter_runtime_err_count - self._retargeter_runtime_last_warn_count
-        if delta >= self._retargeter_runtime_rewarn_every:
-            logger.warning(
-                "WBT tracking_source: retargeter still failing. {} total fallthroughs so far (last reason: {}).",
-                self._retargeter_runtime_err_count,
-                reason,
-            )
-            self._retargeter_runtime_last_warn_count = self._retargeter_runtime_err_count
-
-    def _reset_retargeter_runtime_state(self) -> None:
-        """Clear the one-shot WARN latch + error counter.
-
-        Called on policy stop/start transitions so a transient tracker
-        glitch at the start of a session doesn't silence every future
-        failure in the process lifetime (2026-05-05 code review #6).
-        """
-        self._retargeter_runtime_warned = False
-        self._retargeter_runtime_err_count = 0
-        self._retargeter_runtime_last_warn_count = 0
-
-    def _retarget_payload_to_motion_command(self, payload) -> tuple[np.ndarray, np.ndarray] | None:
-        """Translate a ``TrackingPayload`` into (motion_command_t, ref_quat_xyzw_t).
-
-        Returns a tuple of two arrays on success, or ``None`` when retargeting
-        is not usable — the caller falls through to the ONNX-clip path in
-        that case.
-
-        Return tuple:
-          * ``motion_command_t``: ``(1, 58)`` float32 (29 joint_pos then 29 joint_vel).
-          * ``ref_quat_xyzw_t``: ``(1, 4)`` float32 xyzw root orientation from
-            the retargeter's IK-solved freejoint. Feeds ``motion_ref_ori_b``
-            in ``get_current_obs_buffer_dict`` so the policy's orientation cue
-            tracks live teleop instead of the frozen ONNX-clip baseline.
-
-        Failure modes handled here (all fall through, none raise):
-          * ``robot.urdf_path`` is unset → cannot construct the retargeter.
-          * SMPLRetargeter construction fails (missing deps, bad URDF).
-          * ``joint_transforms`` has the wrong size for (24, 7) reshape.
-          * ``retarget()`` raises (bad quaternions, IK divergence, etc).
-
-        The first retargeter construction is lazy — mink/mujoco are not
-        imported until a non-None payload arrives. This keeps
-        ``NullTrackingSource`` behavior byte-identical to today.
-        """
-        # Initial construction: tried at most once. If it fails, we stay
-        # in ONNX-clip mode for the remainder of this policy's lifetime.
-        #
-        # 2026-05-05 code review #7: mink's IK solver mutates
-        # self._config.q across frames, and when the MuJoCo interface
-        # backend is also active we end up with two MjModel instances
-        # loaded from the same XML in the same process (interface +
-        # retargeter). This is documented-safe for a single policy but
-        # would silently alias state if a secondary policy shared this
-        # retargeter through _shared_hardware_source. We don't support
-        # that today; the assert below is a tripwire.
-        if self._retargeter is None and not self._retargeter_init_failed:
-            if getattr(self, "_shared_hardware_source", False):
-                assert not hasattr(self, "_retargeter_is_shared"), (
-                    "WBT retargeter would be shared across policies via "
-                    "_shared_hardware_source; mink.solve_ik keeps per-frame "
-                    "state in self._config.q which would alias. Not supported."
-                )
-
-            urdf_path = getattr(self.config.robot, "urdf_path", None)
-            if not urdf_path:
-                self._retargeter_init_failed = True
-                logger.warning(
-                    "WBT tracking_source: received payload but robot.urdf_path is unset; "
-                    "cannot construct SMPLRetargeter: falling through to ONNX-clip motion_command."
-                )
-                return None
-            try:
-                from holosoma_retargeting.src.realtime_smpl_retargeter import SMPLRetargeter
-
-                dt = 1.0 / float(self.config.task.rl_rate)
-                import os as _os
-
-                ik_iters = int(_os.environ.get("HOLOSOMA_RETARGETER_IK_ITERS", "4") or 4)
-                self._retargeter = SMPLRetargeter(urdf_path=urdf_path, dt=dt, max_ik_iters=ik_iters)
-            except Exception as exc:
-                self._retargeter_init_failed = True
-                logger.warning(
-                    "WBT tracking_source: failed to construct SMPLRetargeter "
-                    f"(urdf_path={urdf_path!r}): {exc!r}: falling through to ONNX-clip motion_command."
-                )
-                return None
-
-        if self._retargeter is None:
-            return None
-
-        # Reshape flat transforms into (24, 7). TrackingPayload documents
-        # joint_transforms as a flattened (N, 7) array; we expect the SMPL
-        # 24-joint body ordering here.
-        try:
-            transforms = np.asarray(payload.joint_transforms, dtype=np.float32).reshape(24, 7)
-        except (ValueError, AttributeError) as exc:
-            self._retargeter_warn(f"joint_transforms reshape to (24, 7) failed ({exc!r})")
-            return None
-
-        try:
-            q_joints, dq_joints, root_orn_wxyz = self._retargeter.retarget(transforms)
-        except Exception as exc:
-            self._retargeter_warn(f"SMPLRetargeter.retarget raised {exc!r}")
-            return None
-
-        q_joints = np.asarray(q_joints, dtype=np.float32).reshape(-1)
-        dq_joints = np.asarray(dq_joints, dtype=np.float32).reshape(-1)
-        if q_joints.size != self.num_dofs or dq_joints.size != self.num_dofs:
-            self._retargeter_warn(
-                f"retargeter returned unexpected dim (q={q_joints.size}, dq={dq_joints.size}, expected={self.num_dofs})"
-            )
-            return None
-
-        motion_command = np.concatenate([q_joints, dq_joints]).reshape(1, -1)
-
-        # Convert the retargeter's wxyz root quaternion into xyzw and shape
-        # it to match how get_current_obs_buffer_dict consumes
-        # ref_quat_xyzw_t: (1, 4) so self.ref_quat_xyzw_t[0] indexes cleanly
-        # through xyzw_to_wxyz + _remove_yaw_offset. If the retargeter hands
-        # back something non-finite (rare — only seen after a failed IK
-        # solve that nonetheless returned), fall through; motion_command_t
-        # still gets the joint targets but ref_quat_xyzw_t stays at its
-        # last valid value rather than propagating garbage into the obs.
-        root_orn_wxyz = np.asarray(root_orn_wxyz, dtype=np.float32).reshape(-1)
-        if root_orn_wxyz.size != 4 or not np.all(np.isfinite(root_orn_wxyz)):
-            self._retargeter_warn(
-                f"retargeter root_orn_wxyz invalid (size={root_orn_wxyz.size}); keeping previous ref_quat_xyzw_t"
-            )
-            return motion_command, None
-
-        # wxyz -> xyzw: (w, x, y, z) -> (x, y, z, w).
-        ref_quat_xyzw = np.array(
-            [root_orn_wxyz[1], root_orn_wxyz[2], root_orn_wxyz[3], root_orn_wxyz[0]],
-            dtype=np.float32,
-        ).reshape(1, 4)
-        return motion_command, ref_quat_xyzw
 
     def _configure_action_scales(self) -> None:
         """Configure action scales, prioritising ONNX metadata over config fallbacks.
@@ -718,10 +469,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._stiff_hold_active = False
         self._capture_robot_yaw_offset()
         self._capture_motion_yaw_offset(self.ref_quat_xyzw_0)
-        # 2026-05-05 code review #6: clear the retargeter one-shot WARN latch
-        # so a transient tracker glitch at the start of a session doesn't
-        # silence every future failure in the process lifetime.
-        self._reset_retargeter_runtime_state()
+        # 2026-05-05 code review #6: reset the motion-command source on
+        # session boundary so a transient source glitch at the start of a
+        # session doesn't silence every future failure for the process
+        # lifetime.
+        self._motion_command_source.reset()
 
     def _set_motion_timestep(self):
         if self.motion_clip_progressing:
@@ -757,9 +509,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_command_t = self.motion_command_0.copy()
         self.robot_yaw_offset = 0.0
         self.motion_yaw_offset = 0.0
-        # 2026-05-05 code review #6: clear retargeter WARN latch on stop so a
+        # 2026-05-05 code review #6: reset the motion-command source so a
         # restart of the policy doesn't stay silent across transient faults.
-        self._reset_retargeter_runtime_state()
+        self._motion_command_source.reset()
 
     def _handle_start_motion_clip(self):
         """Handle start motion clip action."""
