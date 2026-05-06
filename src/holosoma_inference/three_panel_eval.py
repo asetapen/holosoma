@@ -742,13 +742,16 @@ def main() -> int:
         # starts at zero on frame 0.
         robot_state[0, 7 : 7 + num_dofs] = policy.default_dof_angles
 
-        # The policy's start() path wires ``use_policy_action = True`` only after
-        # a StateCommand.START. Call the same helper the driver's autostart does.
-        try:
-            from holosoma_inference.inputs.api.commands import StateCommand
-            policy._dispatch_command(StateCommand.START)
-        except Exception as exc:
-            print(f"warning: policy start dispatch failed: {exc}", file=sys.stderr)
+        # The policy's start() path wires ``use_policy_action = True`` only
+        # after a StateCommand.START. Call the same helper the driver's
+        # autostart does. Hard fail on failure (walker 2026-05-05 review
+        # #10): three_panel_eval is a diagnostic harness whose entire point
+        # is comparing panel-3 policy output to panels 1/2. Silently
+        # swallowing the START dispatch and running with
+        # ``use_policy_action = False`` would render panel 3 at the default
+        # pose and make the diagnostic misleading.
+        from holosoma_inference.inputs.api.commands import StateCommand
+        policy._dispatch_command(StateCommand.START)
     else:
         print("Skipping in-process WBT policy construction (--online mode).", flush=True)
 
