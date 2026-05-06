@@ -51,20 +51,40 @@ _ACT_RGBA = "0.95 0.55 0.20 1"
 
 def _build_dual_g1_mjcf(g1_xml_path: Path, offset: float = 0.8) -> str:
     """Produce an MJCF with two copies of the G1, one at x=-offset (command)
-    and one at x=+offset (actual). Joint names are suffixed _cmd / _act so
-    MuJoCo accepts the duplicates. Geoms in each copy are tinted so the
-    two robots are visually distinct."""
+    and one at x=+offset (actual). Body/joint names in each copy are
+    suffixed _cmd / _act so MuJoCo accepts the duplicates. Geoms in each
+    copy are tinted so the two robots are visually distinct.
+
+    Design constraints:
+
+    - The <asset> blocks (mesh defs + ground texture/material) live in
+      the source MJCF *outside* <worldbody>. We DO NOT suffix them. Both
+      copies share one <asset> block. This is deliberate: MuJoCo allows
+      multiple geoms to reference the same mesh asset, so we avoid the
+      cost and complexity of duplicating meshes, and we avoid the
+      error-prone dance of also rewriting every mesh="..." ref.
+    - Only the <worldbody> inner is duplicated + suffixed. mesh="..."
+      references inside copy geoms resolve to the shared <asset> mesh
+      by its bare name.
+    - This means the rename pass must NEVER touch mesh="..." attrs or
+      <mesh name="..."/> asset defs. See suffix_names below.
+    """
     import re
 
     raw = g1_xml_path.read_text(encoding="utf-8")
 
-    # We need to rename every named element (body / joint / geom / site / ...)
-    # so the two copies don't collide. The dumb-but-reliable approach: a
-    # regex on name="..." / childclass="..." / ... etc. is fragile. Simpler
-    # approach: use MuJoCo's attach-at-worldbody mechanism via <include> is
-    # also cross-file. So we do the rename inline — only name, joint=, body=
-    # refs — which covers the G1 MJCF shape.
     def suffix_names(xml: str, suffix: str) -> str:
+        """Suffix body/joint/site/constraint names in a worldbody fragment.
+
+        Intentionally narrow: we rename only the attributes that create
+        or reference named bodies/joints/sites/geoms within the
+        worldbody tree. We do NOT rename `mesh="..."` or `material="..."`
+        because those resolve to assets in the shared <asset> block,
+        which we never suffix. If this scope ever broadens to include
+        actuators, tendons, sensors, or equality constraints, audit
+        every cross-reference (e.g. `joint`, `body1`, `site1`) against
+        the source MJCF before merging.
+        """
         # Attribute refs we need to keep consistent. Order matters: do
         # `meshname`-like bare refs AFTER `name=` so we don't double-suffix.
         attrs = ["name", "joint", "body1", "body2", "site1", "site2", "target", "objname"]
