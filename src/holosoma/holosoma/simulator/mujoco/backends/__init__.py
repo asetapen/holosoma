@@ -27,7 +27,7 @@ WARP_AVAILABLE = False
 WarpBackend: type[IMujocoBackend] | None = None
 
 if TYPE_CHECKING:
-    from .warp_backend import WarpBackend as WarpBackendType  # noqa: F401
+    from .warp_backend import WarpBackend as WarpBackendType
 else:
     try:
         from .warp_backend import WarpBackend
