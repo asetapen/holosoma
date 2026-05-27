@@ -50,7 +50,7 @@ class BoosterInterface(BaseInterface):
         """Get robot state as numpy array."""
         return self.state_processor.get_robot_state_data()
 
-    def send_low_command(
+    def _send_low_command_impl(
         self,
         cmd_q: np.ndarray,
         cmd_dq: np.ndarray,
@@ -60,14 +60,38 @@ class BoosterInterface(BaseInterface):
         kd_override: np.ndarray = None,
     ):
         """Send low-level command to robot."""
-        self.command_sender.send_command(
-            cmd_q,
-            cmd_dq,
-            cmd_tau,
-            dof_pos_latest,
-            kp_override=kp_override,
-            kd_override=kd_override,
-        )
+        # When the dampener is wired up, it has already applied kp/kd
+        # scaling to the override arrays passed in. Temporarily disable
+        # the command sender's own kp_level/kd_level scaling so we don't
+        # double-apply, then restore. The kp_level fields stay the
+        # observable surface for back-compat callers that mutate them.
+        if self._dampener is None:
+            self.command_sender.send_command(
+                cmd_q,
+                cmd_dq,
+                cmd_tau,
+                dof_pos_latest,
+                kp_override=kp_override,
+                kd_override=kd_override,
+            )
+            return
+        prev_kp, prev_kd = self.command_sender.kp_level, getattr(self.command_sender, "kd_level", 1.0)
+        self.command_sender.kp_level = 1.0
+        if hasattr(self.command_sender, "kd_level"):
+            self.command_sender.kd_level = 1.0
+        try:
+            self.command_sender.send_command(
+                cmd_q,
+                cmd_dq,
+                cmd_tau,
+                dof_pos_latest,
+                kp_override=kp_override,
+                kd_override=kd_override,
+            )
+        finally:
+            self.command_sender.kp_level = prev_kp
+            if hasattr(self.command_sender, "kd_level"):
+                self.command_sender.kd_level = prev_kd
 
     def get_joystick_msg(self):
         """Get wireless controller message."""

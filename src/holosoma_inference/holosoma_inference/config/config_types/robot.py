@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic.dataclasses import dataclass
 
+from holosoma_inference.sdk.dampening import DampeningConfig
+
 
 @dataclass(frozen=True)
 class RobotConfig:
@@ -233,4 +235,19 @@ class RobotConfig:
     These offsets correct for per-robot motor calibration differences without
     affecting the observation/state space. Converted to radians at init time.
     Length must equal num_joints when provided.
+    """
+
+    # =========================================================================
+    # Dampening (OPTIONAL)
+    # =========================================================================
+
+    dampening: DampeningConfig | None = None
+    """Static dampening configuration.
+
+    When non-None, BaseInterface constructs a Dampener and routes every
+    send_low_command through it before the backend-specific marshalling.
+    Per-knob env vars override these values at runtime; see
+    :class:`holosoma_inference.sdk.dampening.DampeningConfig`.
+
+    Default None preserves identity send_low_command for existing consumers.
     """

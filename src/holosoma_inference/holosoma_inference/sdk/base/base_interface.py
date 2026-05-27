@@ -1,10 +1,23 @@
-"""Base interface for robot control."""
+"""Base interface for robot control.
 
+The dampening seam lives here. ``send_low_command`` is concrete: it runs the
+optional :class:`~holosoma_inference.sdk.dampening.Dampener` against the
+incoming command, then forwards to ``_send_low_command_impl`` which each
+backend implements with its own marshalling. New backends only override
+``_send_low_command_impl`` and inherit the dampener wiring for free.
+"""
+
+from __future__ import annotations
+
+import os
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 import numpy as np
+from loguru import logger
 
 from holosoma_inference.config.config_types import RobotConfig
+from holosoma_inference.sdk.dampening import Dampener
 
 
 class BaseInterface(ABC):
@@ -22,6 +35,8 @@ class BaseInterface(ABC):
         self._last_key_states: dict[str, bool] = {}
         self._wc_key_map = self._default_wc_key_map()
 
+        self._dampener: Dampener | None = self._build_dampener(robot_config)
+
     @abstractmethod
     def get_low_state(self) -> np.ndarray:
         """
@@ -33,7 +48,6 @@ class BaseInterface(ABC):
         """
         raise NotImplementedError
 
-    @abstractmethod
     def send_low_command(
         self,
         cmd_q: np.ndarray,
@@ -43,8 +57,66 @@ class BaseInterface(ABC):
         kp_override: np.ndarray = None,
         kd_override: np.ndarray = None,
     ):
+        """Apply optional dampening, then forward to backend impl.
+
+        Backends implement :meth:`_send_low_command_impl`; do not override
+        this method.
         """
-        Send low-level command to robot.
+        if self._dampener is None:
+            self._send_low_command_impl(
+                cmd_q=cmd_q,
+                cmd_dq=cmd_dq,
+                cmd_tau=cmd_tau,
+                dof_pos_latest=dof_pos_latest,
+                kp_override=kp_override,
+                kd_override=kd_override,
+            )
+            return
+
+        kp_in = np.asarray(
+            kp_override if kp_override is not None else self.robot_config.motor_kp,
+            dtype=np.float64,
+        )
+        kd_in = np.asarray(
+            kd_override if kd_override is not None else self.robot_config.motor_kd,
+            dtype=np.float64,
+        )
+        knobs = self.robot_config.dampening.merged_with_env() if self.robot_config.dampening else None
+        q_d, dq_d, tau_d, kp_d, kd_d = self._dampener.apply(
+            cmd_q=np.asarray(cmd_q, dtype=np.float64),
+            cmd_dq=np.asarray(cmd_dq, dtype=np.float64),
+            cmd_tau=np.asarray(cmd_tau, dtype=np.float64),
+            kp=kp_in,
+            kd=kd_in,
+            dof_pos_latest=dof_pos_latest,
+            knobs=knobs,
+        )
+        self._send_low_command_impl(
+            cmd_q=q_d,
+            cmd_dq=dq_d,
+            cmd_tau=tau_d,
+            dof_pos_latest=dof_pos_latest,
+            kp_override=kp_d,
+            kd_override=kd_d,
+        )
+
+    @abstractmethod
+    def _send_low_command_impl(
+        self,
+        cmd_q: np.ndarray,
+        cmd_dq: np.ndarray,
+        cmd_tau: np.ndarray,
+        dof_pos_latest: np.ndarray = None,
+        kp_override: np.ndarray = None,
+        kd_override: np.ndarray = None,
+    ):
+        """Backend-specific low-level command send.
+
+        Receives commands AFTER the dampener has run (when configured).
+        Backends must NOT re-apply self.kp_level / self.kd_level scaling
+        when self._dampener is not None: the dampener owns kp/kd scaling
+        in the dampened path. The kp_level/kd_level fields stay for
+        back-compat in the non-dampened path.
 
         Args:
             cmd_q: target joint positions (N,)
@@ -67,6 +139,31 @@ class BaseInterface(ABC):
             robot_config: The new robot configuration.
         """
         self.robot_config = robot_config
+        self._dampener = self._build_dampener(robot_config)
+
+    def _build_dampener(self, robot_config: RobotConfig) -> Dampener | None:
+        """Construct the per-interface Dampener when dampening is configured.
+
+        Joint limits come from :meth:`_resolve_joint_limits`, which backends
+        can override. Returns None when robot_config.dampening is None so
+        send_low_command stays an identity transform for legacy consumers.
+        """
+        if robot_config.dampening is None:
+            return None
+        limits = self._resolve_joint_limits(robot_config)
+        if limits is None:
+            return Dampener()
+        return Dampener(joint_limits_lo=limits[0], joint_limits_hi=limits[1])
+
+    def _resolve_joint_limits(self, robot_config: RobotConfig) -> tuple[np.ndarray, np.ndarray] | None:
+        """Best-effort joint-limit lookup for the q_limit_scale dampener knob.
+
+        Default returns None (no MJCF available). UnitreeInterface overrides
+        this to consult the holosoma_retargeting MJCF; backends without an
+        MJCF concept (e.g. booster sdk2py) inherit the None default and
+        leave HOLOSOMA_Q_LIMIT_SCALE as a no-op.
+        """
+        return None
 
     @abstractmethod
     def get_joystick_msg(self):
@@ -184,3 +281,61 @@ class BaseInterface(ABC):
     @abstractmethod
     def kd_level(self, value):
         raise NotImplementedError
+
+
+def load_joint_limits_from_mjcf(robot_config: RobotConfig) -> tuple[np.ndarray, np.ndarray] | None:
+    """Best-effort MJCF joint-limit lookup for the dampening clip knob.
+
+    Resolves the same MJCF the retargeter uses and pulls per-joint hard
+    limits in dof_names order. Returns (lo, hi) arrays indexed by joint
+    or None when no MJCF is reachable (mujoco not installed,
+    holosoma_retargeting absent on the host, MJCF parse error).
+    Joints not found in the MJCF are left as +/-inf so the dampener's
+    finite-only mask leaves them unclipped.
+    """
+    try:
+        import mujoco
+    except ImportError:
+        return None
+
+    candidates: list[Path] = []
+    override = os.environ.get("HOLOSOMA_MUJOCO_MJCF")
+    if override:
+        candidates.append(Path(override))
+    urdf = getattr(robot_config, "urdf_path", None)
+    if urdf and urdf.endswith(".xml"):
+        candidates.append(Path(urdf))
+    try:
+        import holosoma_retargeting
+
+        candidates.append(
+            Path(holosoma_retargeting.__file__).parent
+            / "models"
+            / robot_config.robot
+            / f"{robot_config.robot_type}.xml"
+        )
+    except Exception as exc:
+        logger.debug("holosoma_retargeting path probe failed: {}", exc)
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            model = mujoco.MjModel.from_xml_path(str(path))
+        except Exception as exc:
+            logger.debug("MJCF load failed at {}: {}", path, exc)
+            continue
+        lo = np.full(robot_config.num_joints, -np.inf)
+        hi = np.full(robot_config.num_joints, np.inf)
+        any_named = False
+        for j_id, name in enumerate(robot_config.dof_names):
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            if jid < 0:
+                continue
+            any_named = True
+            if bool(model.jnt_limited[jid]):
+                lo[j_id] = float(model.jnt_range[jid][0])
+                hi[j_id] = float(model.jnt_range[jid][1])
+        if any_named:
+            return lo, hi
+    return None

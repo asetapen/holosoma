@@ -3,18 +3,23 @@
 import numpy as np
 
 from holosoma_inference.config.config_types import RobotConfig
-from holosoma_inference.sdk.base.base_interface import BaseInterface
+from holosoma_inference.sdk.base.base_interface import BaseInterface, load_joint_limits_from_mjcf
 
 
 class UnitreeInterface(BaseInterface):
     """Interface for Unitree robots using C++/pybind11 binding."""
 
     def __init__(self, robot_config: RobotConfig, domain_id=0, interface_str=None, use_joystick=True):
-        super().__init__(robot_config, domain_id, interface_str, use_joystick)
+        # Initialize gain levels before super().__init__ in case the
+        # dampener-build path ever needs them.
         self._unitree_motor_order = None
         self._kp_level = 1.0
         self._kd_level = 1.0
+        super().__init__(robot_config, domain_id, interface_str, use_joystick)
         self._init_binding()
+
+    def _resolve_joint_limits(self, robot_config: RobotConfig):
+        return load_joint_limits_from_mjcf(robot_config)
 
     def _init_binding(self):
         """Initialize C++/pybind11 binding."""
@@ -63,7 +68,7 @@ class UnitreeInterface(BaseInterface):
 
         return np.concatenate([base_pos, quat, joint_pos, base_lin_vel, base_ang_vel, joint_vel]).reshape(1, -1)
 
-    def send_low_command(
+    def _send_low_command_impl(
         self,
         cmd_q: np.ndarray,
         cmd_dq: np.ndarray,
@@ -97,8 +102,18 @@ class UnitreeInterface(BaseInterface):
 
         motor_kp = np.array(cmd_kp if cmd_kp is not None else self.robot_config.motor_kp)
         motor_kd = np.array(cmd_kd if cmd_kd is not None else self.robot_config.motor_kd)
-        cmd.kp = list(motor_kp * self._kp_level)
-        cmd.kd = list(motor_kd * self._kd_level)
+        # Skip kp_level/kd_level scaling when the dampener is wired up: the
+        # dampener owns kp/kd scaling in that path and double-applying
+        # would silently halve gains for any operator running with both
+        # robot_config.dampening set and a non-1.0 self._kp_level. The
+        # back-compat fields stay live for the non-dampened path so legacy
+        # callers that mutate kp_level keep working unchanged.
+        if self._dampener is None:
+            cmd.kp = list(motor_kp * self._kp_level)
+            cmd.kd = list(motor_kd * self._kd_level)
+        else:
+            cmd.kp = list(motor_kp)
+            cmd.kd = list(motor_kd)
 
         self.unitree_interface.write_low_command(cmd)
 
